@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.bam
+*.bai
+*.parquet
+*.log
+*.mmi
+build/
+dist/
+*.egg-info/
+.idea/
+.vscode/
