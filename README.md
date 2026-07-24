@@ -31,7 +31,7 @@ Python dependencies are listed in `requirements.txt` and `pyproject.toml`:
 ### Install from a cloned Git repository
 
 ```bash
-git clone https://github.com/your-account/RiboTxAlign.git
+git clone https://github.com/uedaLabR/RiboTxAlign.git
 cd RiboTxAlign
 
 python3 -m venv .venv
