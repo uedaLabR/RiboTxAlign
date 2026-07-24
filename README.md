@@ -55,7 +55,7 @@ ribotxalign --version
 Use an editable installation when modifying the source code:
 
 ```bash
-git clone https://github.com/your-account/RiboTxAlign.git
+git clone https://github.com/uedaLabR/RiboTxAlign.git
 cd RiboTxAlign
 
 python3 -m venv .venv
