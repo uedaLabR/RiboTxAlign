@@ -1,221 +1,140 @@
 from __future__ import annotations
 
-import logging
 import time
-from concurrent.futures import ProcessPoolExecutor
-from dataclasses import dataclass, fields
-from multiprocessing import get_context
+from fnmatch import fnmatch
+from concurrent.futures import (
+    ProcessPoolExecutor,
+)
+from dataclasses import dataclass
+from multiprocessing import (
+    get_context,
+)
 from pathlib import Path
-from typing import Iterator
 
-import mappy as mp
-
-from mapping.bam_writer import GenomeBamWriter
-from mapping.cigar_utils import add_soft_clips
-from mapping.coordinate_converter import CoordinateConverter
+from mapping.common import (
+    MappingCounters,
+    ReadRecord,
+    create_logger,
+    read_fastq_batches,
+)
 from mapping.mappy_mapper import MappyMapper
-from mapping.mapping_result import ProjectedAlignment, RawAlignment
-from mapping.parquet_writer import MappingParquetWriter
+from mapping.parquet_writer import (
+    MappingBatchPartWriter,
+)
+from mapping.reference_id import (
+    get_group_id,
+)
 
 
-_WORKER_GENOME_MAPPER: MappyMapper | None = None
-_WORKER_TRANSCRIPT_MAPPER: MappyMapper | None = None
-_WORKER_CONVERTER: CoordinateConverter | None = None
-_WORKER_TRANSCRIPT_CANDIDATE_COUNT = 4
+_WORKER_MAPPER: MappyMapper | None = None
 
 
-@dataclass
-class ReadRecord:
-    read_id: str
-    sequence: str
-    quality: str
+@dataclass(slots=True)
+class WorkerTask:
+    """One mapping-and-writing task sent to a worker."""
+
+    reads: list[ReadRecord]
+    output_directory: str
+    part_index: int
+    parquet_row_group_size: int
+    exclude_decoy_reads: bool
+    decoy_reference_patterns: tuple[str, ...]
 
 
-@dataclass
-class MappedRead:
-    read_id: str
-    sequence: str
-    quality: str
-    alignments: list[ProjectedAlignment]
-    genome_status: str
-    genome_hit_count: int
-    transcript_over_candidate_limit: bool = False
+@dataclass(slots=True)
+class WorkerResult:
+    """Small result returned from a worker."""
 
-
-@dataclass
-class MappingCounters:
-    read_count: int = 0
-    genome_unique_count: int = 0
-    transcript_single_count: int = 0
-    transcript_multi_count: int = 0
-    transcript_multihit_2_count: int = 0
-    transcript_multihit_3_count: int = 0
-    transcript_multihit_4_count: int = 0
-    transcript_multihit_5_count: int = 0
-    transcript_multihit_6_count: int = 0
-    transcript_multihit_7_count: int = 0
-    transcript_multihit_8_count: int = 0
-    transcript_multihit_over8_count: int = 0
-    unmapped_count: int = 0
-    conversion_errors: int = 0
-    genome_multi_transcript_unmapped_count: int = 0
-    genome_softclip_transcript_unmapped_count: int = 0
-    genome_unmapped_transcript_unmapped_count: int = 0
-    genome_no_hit_count: int = 0
-    genome_single_hit_count: int = 0
-    genome_equal_score_count: int = 0
-    genome_unequal_score_count: int = 0
-    genome_best_not_full_length_count: int = 0
-
-    def add(self, other: "MappingCounters") -> None:
-        for field_info in fields(self):
-            field_name = field_info.name
-            setattr(
-                self,
-                field_name,
-                getattr(self, field_name)
-                + getattr(other, field_name),
-            )
-
-
-@dataclass
-class ChunkResult:
-    mapped_reads: list[MappedRead]
     counters: MappingCounters
-    conversion_error_messages: list[str]
+    mapped_read_count: int
+    decoy_filtered_read_count: int
+    output_files: list[str]
 
 
-def project_genome_alignment(
-    alignment: RawAlignment,
-    read_length: int,
-) -> ProjectedAlignment:
-    is_reverse = alignment.strand == -1
+def _get_reference_chromosome(
+    reference_name: str,
+) -> str:
+    """Extract the chromosome component from a reference ID."""
 
-    return ProjectedAlignment(
-        read_id=alignment.read_id,
-        chrom=alignment.reference_name,
-        reference_start=alignment.reference_start,
-        cigartuples=add_soft_clips(
-            cigartuples=alignment.cigartuples,
-            query_start=alignment.query_start,
-            query_end=alignment.query_end,
-            read_length=read_length,
-            is_reverse=is_reverse,
-        ),
-        is_reverse=is_reverse,
-        mapq=alignment.mapq,
-        edit_distance=alignment.edit_distance,
-        score=alignment.score,
-        source_reference=alignment.reference_name,
-        source_reference_start=alignment.reference_start,
-        source_reference_end=alignment.reference_end,
-        support_sources={"genome"},
-        assignment_weight=1.0,
+    for separator in (
+        "_plus_",
+        "_minus_",
+    ):
+        if separator in reference_name:
+            return reference_name.split(
+                separator,
+                maxsplit=1,
+            )[0]
+
+    return reference_name
+
+
+def _parse_decoy_reference_patterns(
+    pattern_text: str,
+) -> tuple[str, ...]:
+    """Parse comma-separated decoy reference patterns."""
+
+    return tuple(
+        pattern.strip()
+        for pattern in pattern_text.split(
+            ","
+        )
+        if pattern.strip()
     )
 
 
-def classify_genome_hits(
-    hits: list[RawAlignment],
-    read_length: int,
-) -> tuple[str, RawAlignment | None]:
-    if not hits:
-        return "unmapped", None
+def _is_decoy_reference(
+    reference_name: str,
+    decoy_reference_patterns: tuple[str, ...],
+) -> bool:
+    """Return whether a reference chromosome matches a decoy pattern."""
 
-    best_hit = hits[0]
+    chromosome = _get_reference_chromosome(
+        reference_name
+    )
 
-    if not best_hit.is_full_length(read_length):
-        return "soft_clipped", None
-
-    if len(hits) == 1:
-        return "unique", best_hit
-
-    if best_hit.score == hits[1].score:
-        return "multi_equal_score", None
-
-    return "unique", best_hit
+    return any(
+        fnmatch(
+            chromosome,
+            pattern,
+        )
+        for pattern in decoy_reference_patterns
+    )
 
 
-def select_equal_score_transcript_hits(
-    hits: list[RawAlignment],
-    read_length: int,
-    maximum_candidates: int | None = None,
-) -> list[RawAlignment]:
-    full_length_hits = [
-        hit
-        for hit in hits
-        if hit.is_full_length(read_length)
-    ]
+def _contains_decoy_hit(
+    alignments,
+    decoy_reference_patterns: tuple[str, ...],
+) -> bool:
+    """Return whether any retained best hit maps to a decoy reference."""
 
-    if not full_length_hits:
-        return []
-
-    best_score = full_length_hits[0].score
-
-    equal_score_hits = [
-        hit
-        for hit in full_length_hits
-        if hit.score == best_score
-    ]
-
-    if maximum_candidates is None:
-        return equal_score_hits
-
-    return equal_score_hits[:maximum_candidates]
+    return any(
+        _is_decoy_reference(
+            alignment.reference_name,
+            decoy_reference_patterns,
+        )
+        for alignment in alignments
+    )
 
 
-def deduplicate_projected_alignments(
-    alignments: list[ProjectedAlignment],
-) -> list[ProjectedAlignment]:
-    deduplicated: dict[tuple, ProjectedAlignment] = {}
+def _count_candidate_groups(
+    alignments,
+) -> int:
+    """Return the number of distinct candidate groups."""
 
-    for alignment in alignments:
-        key = alignment.deduplication_key
-
-        if key not in deduplicated:
-            deduplicated[key] = alignment
-        else:
-            deduplicated[key].support_sources.update(
-                alignment.support_sources
+    return len(
+        {
+            get_group_id(
+                alignment.reference_name
             )
-
-    return list(deduplicated.values())
-
-
-def create_logger(log_file: str) -> logging.Logger:
-    logger = logging.getLogger("RiboTxAlignMT")
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
-
-    for handler in logger.handlers[:]:
-        logger.removeHandler(handler)
-        handler.close()
-
-    formatter = logging.Formatter(
-        "%(asctime)s\t%(levelname)s\t%(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+            for alignment in alignments
+        }
     )
 
-    file_handler = logging.FileHandler(
-        log_file,
-        mode="w",
-        encoding="utf-8",
-    )
-    file_handler.setFormatter(formatter)
 
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(formatter)
-
-    logger.addHandler(file_handler)
-    logger.addHandler(stream_handler)
-
-    return logger
-
-
-def initialize_mapping_worker(
-    genome_fasta: str,
+def initialize_worker(
     transcript_fasta: str,
-    coordinate_tsv: str,
-    transcript_candidate_count: int,
+    maximum_candidates: int,
     kmer_size: int,
     window_size: int,
     minimum_minimizers: int,
@@ -224,353 +143,143 @@ def initialize_mapping_worker(
     minimum_query_coverage: float,
     minimum_identity: float,
 ) -> None:
-    """
-    Initialize one independent mapper pair in each process.
-    """
+    """Create one independent mapper in each worker process."""
 
-    global _WORKER_GENOME_MAPPER
-    global _WORKER_TRANSCRIPT_MAPPER
-    global _WORKER_CONVERTER
-    global _WORKER_TRANSCRIPT_CANDIDATE_COUNT
+    global _WORKER_MAPPER
 
-    _WORKER_GENOME_MAPPER = MappyMapper(
-        reference_path=genome_fasta,
-        source="genome",
-        preset="sr",
-        kmer_size=kmer_size,
-        window_size=window_size,
-        minimum_minimizers=minimum_minimizers,
-        minimum_chain_score=minimum_chain_score,
-        minimum_dp_score=minimum_dp_score,
-        maximum_hits=2,
-        index_threads=1,
-        minimum_query_coverage=minimum_query_coverage,
-        minimum_identity=minimum_identity,
-    )
-
-    _WORKER_TRANSCRIPT_MAPPER = MappyMapper(
+    _WORKER_MAPPER = MappyMapper(
         reference_path=transcript_fasta,
-        source="transcript",
-        preset="sr",
+        maximum_candidates=maximum_candidates,
+        index_threads=1,
         kmer_size=kmer_size,
         window_size=window_size,
         minimum_minimizers=minimum_minimizers,
         minimum_chain_score=minimum_chain_score,
         minimum_dp_score=minimum_dp_score,
-        maximum_hits=max(32, transcript_candidate_count * 16),
-        index_threads=1,
         minimum_query_coverage=minimum_query_coverage,
         minimum_identity=minimum_identity,
     )
 
-    _WORKER_CONVERTER = CoordinateConverter(
-        coordinate_tsv
-    )
 
-    _WORKER_TRANSCRIPT_CANDIDATE_COUNT = (
-        transcript_candidate_count
-    )
-
-
-def _require_worker_objects() -> tuple[
-    MappyMapper,
-    MappyMapper,
-    CoordinateConverter,
-]:
-    if _WORKER_GENOME_MAPPER is None:
-        raise RuntimeError(
-            "Genome mapper is not initialized."
-        )
-
-    if _WORKER_TRANSCRIPT_MAPPER is None:
-        raise RuntimeError(
-            "Transcript mapper is not initialized."
-        )
-
-    if _WORKER_CONVERTER is None:
-        raise RuntimeError(
-            "Coordinate converter is not initialized."
-        )
-
-    return (
-        _WORKER_GENOME_MAPPER,
-        _WORKER_TRANSCRIPT_MAPPER,
-        _WORKER_CONVERTER,
-    )
-
-
-def map_read_chunk(
-    reads: list[ReadRecord],
-) -> ChunkResult:
+def map_and_write_chunk(
+    task: WorkerTask,
+) -> WorkerResult:
     """
-    Map one read chunk inside one worker process.
+    Map one read chunk and write chromosome-level Parquet parts.
+
+    Mapping records remain inside the worker process. Only counters and
+    output filenames are returned to the parent process.
     """
 
-    (
-        genome_mapper,
-        transcript_mapper,
-        converter,
-    ) = _require_worker_objects()
+    if _WORKER_MAPPER is None:
+        raise RuntimeError(
+            "Worker mapper is not initialized."
+        )
 
     counters = MappingCounters()
-    mapped_reads: list[MappedRead] = []
-    conversion_error_messages: list[str] = []
 
-    for read in reads:
-        counters.read_count += 1
-        read_length = len(read.sequence)
-
-        # Reset the per-read flag before any mapping branch.
-        transcript_over_candidate_limit = False
-
-        genome_hits = genome_mapper.map_read(
-            read_id=read.read_id,
-            sequence=read.sequence,
-        )
-
-        (
-            genome_status,
-            genome_best_hit,
-        ) = classify_genome_hits(
-            hits=genome_hits,
-            read_length=read_length,
-        )
-
-        if not genome_hits:
-            counters.genome_no_hit_count += 1
-
-        else:
-            best_hit = genome_hits[0]
-
-            if not best_hit.is_full_length(
-                read_length
-            ):
-                counters.genome_best_not_full_length_count += 1
-
-            elif len(genome_hits) == 1:
-                counters.genome_single_hit_count += 1
-
-            elif (
-                genome_hits[0].score
-                == genome_hits[1].score
-            ):
-                counters.genome_equal_score_count += 1
-
-            else:
-                counters.genome_unequal_score_count += 1
-
-        if (
-            genome_status == "unique"
-            and genome_best_hit is not None
-        ):
-            counters.genome_unique_count += 1
-
-            output_alignments = [
-                project_genome_alignment(
-                    alignment=genome_best_hit,
-                    read_length=read_length,
-                )
-            ]
-
-        else:
-            transcript_hits = transcript_mapper.map_read(
-                read_id=read.read_id,
-                sequence=read.sequence,
-            )
-
-            transcript_candidates = (
-                select_equal_score_transcript_hits(
-                    hits=transcript_hits,
-                    read_length=read_length,
-                    maximum_candidates=None,
-                )
-            )
-
-            output_alignments: list[
-                ProjectedAlignment
-            ] = []
-
-            for transcript_hit in transcript_candidates:
-                try:
-                    output_alignments.append(
-                        converter.project_alignment(
-                            alignment=transcript_hit,
-                            read_length=read_length,
-                        )
-                    )
-
-                except (
-                    KeyError,
-                    ValueError,
-                ) as error:
-                    counters.conversion_errors += 1
-
-                    if len(
-                        conversion_error_messages
-                    ) < 10:
-                        conversion_error_messages.append(
-                            (
-                                "Coordinate conversion skipped: "
-                                f"read={read.read_id} "
-                                "reference="
-                                f"{transcript_hit.reference_name} "
-                                f"error={error}"
-                            )
-                        )
-
-            deduplicated_alignments = (
-                deduplicate_projected_alignments(
-                    output_alignments
-                )
-            )
-            candidate_count = len(deduplicated_alignments)
-
-            if candidate_count == 0:
-                counters.unmapped_count += 1
-
-                if (
-                    genome_status
-                    == "multi_equal_score"
-                ):
-                    counters.genome_multi_transcript_unmapped_count += 1
-
-                elif genome_status == "soft_clipped":
-                    counters.genome_softclip_transcript_unmapped_count += 1
-
-                elif genome_status == "unmapped":
-                    counters.genome_unmapped_transcript_unmapped_count += 1
-
-                output_alignments = []
-
-            elif candidate_count == 1:
-                counters.transcript_single_count += 1
-                output_alignments = deduplicated_alignments
-                output_alignments[
-                    0
-                ].assignment_weight = 1.0
-
-            elif candidate_count > _WORKER_TRANSCRIPT_CANDIDATE_COUNT:
-                # Reads with more than the configured number of genomic
-                # candidates are recorded as unresolved multi-mappers.
-                # They remain in multiplemap.bam but are not written to the
-                # EM candidate Parquet.
-                counters.transcript_multi_count += 1
-                counters.transcript_multihit_over8_count += 1
-                transcript_over_candidate_limit = True
-                output_alignments = []
-
-            else:
-                counters.transcript_multi_count += 1
-                output_alignments = deduplicated_alignments
-
-                if candidate_count == 2:
-                    counters.transcript_multihit_2_count += 1
-                elif candidate_count == 3:
-                    counters.transcript_multihit_3_count += 1
-                elif candidate_count == 4:
-                    counters.transcript_multihit_4_count += 1
-                elif candidate_count == 5:
-                    counters.transcript_multihit_5_count += 1
-                elif candidate_count == 6:
-                    counters.transcript_multihit_6_count += 1
-                elif candidate_count == 7:
-                    counters.transcript_multihit_7_count += 1
-                elif candidate_count == 8:
-                    counters.transcript_multihit_8_count += 1
-
-                # Multi-mapping candidates are kept unweighted here.
-                # Their final fractional weights will be estimated later.
-                equal_weight = 1.0 / candidate_count
-                for alignment in output_alignments:
-                    alignment.assignment_weight = equal_weight
-
-        mapped_reads.append(
-            MappedRead(
-                read_id=read.read_id,
-                sequence=read.sequence,
-                quality=read.quality,
-                alignments=output_alignments,
-                genome_status=genome_status,
-                genome_hit_count=len(genome_hits),
-                transcript_over_candidate_limit=(
-                    transcript_over_candidate_limit
-                ),
-            )
-        )
-
-    return ChunkResult(
-        mapped_reads=mapped_reads,
-        counters=counters,
-        conversion_error_messages=(
-            conversion_error_messages
+    writer = MappingBatchPartWriter(
+        output_directory=(
+            task.output_directory
+        ),
+        batch_index=(
+            task.part_index
+        ),
+        row_group_size=(
+            task.parquet_row_group_size
         ),
     )
 
+    mapped_read_count = 0
+    decoy_filtered_read_count = 0
 
-def read_fastq_batches(
-    fastq_path: str,
-    batch_size: int,
-    maximum_reads: int | None,
-) -> Iterator[list[ReadRecord]]:
-    """
-    Read FASTQ records in bounded batches.
-    """
+    for read in task.reads:
+        counters.total_reads += 1
 
-    batch: list[ReadRecord] = []
-    total_read_count = 0
-
-    for (
-        read_id,
-        sequence,
-        quality,
-    ) in mp.fastx_read(
-        fastq_path
-    ):
-        batch.append(
-            ReadRecord(
-                read_id=read_id,
-                sequence=sequence,
-                quality=quality,
+        alignments, limit_reached = (
+            _WORKER_MAPPER.map_read(
+                read_id=read.read_id,
+                sequence=read.sequence,
             )
         )
 
-        total_read_count += 1
+        if limit_reached:
+            counters.best_hit_overflow_reads += 1
 
-        if len(batch) >= batch_size:
-            yield batch
-            batch = []
+        if not alignments:
+            counters.unmapped_reads += 1
+            continue
 
         if (
-            maximum_reads is not None
-            and total_read_count >= maximum_reads
+            task.exclude_decoy_reads
+            and _contains_decoy_hit(
+                alignments,
+                task.decoy_reference_patterns,
+            )
         ):
-            break
+            decoy_filtered_read_count += 1
+            continue
 
-    if batch:
-        yield batch
+        counters.mapped_reads += 1
+        mapped_read_count += 1
+
+        writer.add_read(
+            read_id=read.read_id,
+            read_length=len(
+                read.sequence
+            ),
+            alignments=alignments,
+        )
+
+        if (
+            _count_candidate_groups(
+                alignments
+            )
+            == 1
+        ):
+            counters.group_unique_reads += 1
+        else:
+            counters.group_multi_reads += 1
+
+    output_paths = writer.write_and_close()
+
+    return WorkerResult(
+        counters=counters,
+        mapped_read_count=(
+            mapped_read_count
+        ),
+        decoy_filtered_read_count=(
+            decoy_filtered_read_count
+        ),
+        output_files=[
+            str(
+                output_path
+            )
+            for output_path
+            in output_paths
+        ],
+    )
 
 
 def split_batch(
     reads: list[ReadRecord],
     worker_count: int,
 ) -> list[list[ReadRecord]]:
-    """
-    Split one batch into approximately equal chunks.
-    """
+    """Split one FASTQ batch into approximately equal worker chunks."""
 
     if not reads:
         return []
 
-    actual_worker_count = min(
+    actual_workers = min(
         worker_count,
         len(reads),
     )
 
     chunk_size = (
         len(reads)
-        + actual_worker_count
+        + actual_workers
         - 1
-    ) // actual_worker_count
+    ) // actual_workers
 
     return [
         reads[
@@ -585,16 +294,12 @@ def split_batch(
     ]
 
 
-def run_dual_mapping_to_bam_mt(
+def run_transcript_mapping_to_parquet_mt(
     fastq_path: str,
-    genome_fasta: str,
     transcript_fasta: str,
-    coordinate_tsv: str,
-    unique_bam: str,
-    multiplemap_bam: str,
-    mapping_parquet: str,
+    mapping_parts_directory: str,
     maximum_reads: int | None = None,
-    transcript_candidate_count: int = 8,
+    maximum_candidates: int = 16,
     kmer_size: int = 11,
     window_size: int = 5,
     minimum_minimizers: int = 2,
@@ -602,62 +307,134 @@ def run_dual_mapping_to_bam_mt(
     minimum_dp_score: int = 15,
     minimum_query_coverage: float = 0.85,
     minimum_identity: float = 0.90,
-    worker_count: int = 4,
-    reads_per_worker: int = 10000,
-    sort_threads: int = 8,
+    worker_count: int = 6,
+    reads_per_worker: int = 50000,
     progress_interval: int = 100000,
-    parquet_batch_size: int = 100000,
+    parquet_row_group_size: int = 100000,
+    exclude_decoy_reads: bool = True,
+    decoy_reference_patterns: str = (
+        "chrUn_*,*_random"
+    ),
     log_file: str | None = None,
     multiprocessing_start_method: str = "spawn",
-) -> None:
-    """Map reads and separate unique and multiple mappings.
+) -> MappingCounters:
+    """
+    Map reads and write worker-level chromosome Parquet parts.
 
-    Unique reads are written with their genomic alignment to ``unique_bam``.
-    Reads with two or more transcript candidates are written once as unmapped
-    records to ``multiplemap_bam``. Their candidate mapping information is
-    stored separately in ``mapping_parquet``.
+    Each worker maps one bounded chunk and writes its own part files.
+    Mapping records are therefore not transferred back to the parent.
+
+    Output partitioning must be chromosome-only in
+    ``MappingBatchPartWriter``:
+
+        chr1.part000000.parquet
+        chr2.part000000.parquet
+
+    Strand remains in group IDs and row data, but plus and minus strands
+    are not written to separate files.
     """
 
     if worker_count < 1:
-        raise ValueError("worker_count must be at least 1.")
+        raise ValueError(
+            "worker_count must be at least 1."
+        )
+
     if reads_per_worker < 1:
-        raise ValueError("reads_per_worker must be at least 1.")
+        raise ValueError(
+            "reads_per_worker must be at least 1."
+        )
+
+
+    parsed_decoy_reference_patterns = (
+        _parse_decoy_reference_patterns(
+            decoy_reference_patterns
+        )
+    )
+
+    output_directory = Path(
+        mapping_parts_directory
+    )
+    output_directory.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     if log_file is None:
-        log_file = str(Path(unique_bam).with_suffix(".mapping_mt.log"))
+        log_file = str(
+            output_directory
+            / "mapping_mt.log"
+        )
 
-    Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-    logger = create_logger(log_file)
+    logger = create_logger(
+        "RiboTxAlignMT",
+        log_file,
+    )
+
+    counters = MappingCounters()
+    decoy_filtered_read_count = 0
     start_time = time.time()
-    total_counters = MappingCounters()
-    displayed_read_count = 0
-    next_progress_count = progress_interval
-    batch_size = worker_count * reads_per_worker
+    next_progress = progress_interval
 
-    logger.info("Multiprocess mapping started")
-    logger.info("FASTQ: %s", fastq_path)
-    logger.info("Genome FASTA: %s", genome_fasta)
-    logger.info("Transcript FASTA: %s", transcript_fasta)
-    logger.info("Coordinate TSV: %s", coordinate_tsv)
-    logger.info("Unique BAM: %s", unique_bam)
-    logger.info("Multiple-map BAM: %s", multiplemap_bam)
-    logger.info("Mapping Parquet: %s", mapping_parquet)
-    logger.info("Worker count: %d", worker_count)
-    logger.info("Reads per worker: %d", reads_per_worker)
-    logger.info("Batch size: %d", batch_size)
-    logger.info("Maximum reads: %s", "all" if maximum_reads is None else maximum_reads)
+    fastq_batch_size = (
+        worker_count
+        * reads_per_worker
+    )
 
-    mp_context = get_context(multiprocessing_start_method)
+    logger.info(
+        "Multiprocess transcript mapping started"
+    )
+    logger.info(
+        "FASTQ: %s",
+        fastq_path,
+    )
+    logger.info(
+        "Transcript FASTA: %s",
+        transcript_fasta,
+    )
+    logger.info(
+        "Mapping-parts directory: %s",
+        output_directory,
+    )
+    logger.info(
+        "Worker count: %d",
+        worker_count,
+    )
+    logger.info(
+        "Reads per worker: %d",
+        reads_per_worker,
+    )
+    logger.info(
+        "Reads per FASTQ batch: %d",
+        fastq_batch_size,
+    )
+    logger.info(
+        "Output partition: chromosome only"
+    )
+    logger.info(
+        "Worker output: enabled"
+    )
+    logger.info(
+        "Exclude decoy reads: %s",
+        exclude_decoy_reads,
+    )
+    logger.info(
+        "Decoy reference patterns: %s",
+        ",".join(
+            parsed_decoy_reference_patterns
+        ),
+    )
+
+    context = get_context(
+        multiprocessing_start_method
+    )
 
     with ProcessPoolExecutor(
         max_workers=worker_count,
-        mp_context=mp_context,
-        initializer=initialize_mapping_worker,
+        mp_context=context,
+        initializer=initialize_worker,
         initargs=(
-            genome_fasta,
             transcript_fasta,
-            coordinate_tsv,
-            transcript_candidate_count,
+            maximum_candidates,
             kmer_size,
             window_size,
             minimum_minimizers,
@@ -667,133 +444,186 @@ def run_dual_mapping_to_bam_mt(
             minimum_identity,
         ),
     ) as executor:
-        with (
-            GenomeBamWriter(
-                genome_fasta=genome_fasta,
-                output_bam=unique_bam,
-                sort_threads=sort_threads,
-            ) as unique_writer,
-            GenomeBamWriter(
-                genome_fasta=genome_fasta,
-                output_bam=multiplemap_bam,
-                sort_threads=sort_threads,
-            ) as multiple_writer,
-            MappingParquetWriter(
-                output_parquet=mapping_parquet,
-                batch_size=parquet_batch_size,
-            ) as parquet_writer,
-        ):
-            for batch in read_fastq_batches(
+        for fastq_batch_index, batch in enumerate(
+            read_fastq_batches(
                 fastq_path=fastq_path,
-                batch_size=batch_size,
+                batch_size=fastq_batch_size,
                 maximum_reads=maximum_reads,
+            )
+        ):
+            batch_start = time.time()
+
+            chunks = split_batch(
+                batch,
+                worker_count,
+            )
+
+            tasks = [
+                WorkerTask(
+                    reads=chunk,
+                    output_directory=str(
+                        output_directory
+                    ),
+                    part_index=(
+                        fastq_batch_index
+                        * worker_count
+                        + chunk_index
+                    ),
+                    parquet_row_group_size=(
+                        parquet_row_group_size
+                    ),
+                    exclude_decoy_reads=(
+                        exclude_decoy_reads
+                    ),
+                    decoy_reference_patterns=(
+                        parsed_decoy_reference_patterns
+                    ),
+                )
+                for chunk_index, chunk
+                in enumerate(
+                    chunks
+                )
+            ]
+
+            batch_mapped_read_count = 0
+            batch_decoy_filtered_read_count = 0
+            batch_output_files: list[str] = []
+
+            for worker_result in executor.map(
+                map_and_write_chunk,
+                tasks,
             ):
-                chunks = split_batch(reads=batch, worker_count=worker_count)
-                chunk_results = executor.map(map_read_chunk, chunks)
+                counters.add(
+                    worker_result.counters
+                )
 
-                for chunk_result in chunk_results:
-                    total_counters.add(chunk_result.counters)
+                batch_mapped_read_count += (
+                    worker_result.mapped_read_count
+                )
 
-                    for message in chunk_result.conversion_error_messages:
-                        if total_counters.conversion_errors <= 10:
-                            logger.warning(message)
+                batch_decoy_filtered_read_count += (
+                    worker_result.decoy_filtered_read_count
+                )
 
-                    for mapped_read in chunk_result.mapped_reads:
-                        hit_count = len(mapped_read.alignments)
+                decoy_filtered_read_count += (
+                    worker_result.decoy_filtered_read_count
+                )
 
-                        if hit_count == 1:
-                            unique_writer.write_read(
-                                read_id=mapped_read.read_id,
-                                sequence=mapped_read.sequence,
-                                quality=mapped_read.quality,
-                                alignments=mapped_read.alignments,
-                            )
-                        elif hit_count >= 2:
-                            # Store the read sequence once, without choosing a
-                            # genomic placement before EM allocation.
-                            multiple_writer.write_read(
-                                read_id=mapped_read.read_id,
-                                sequence=mapped_read.sequence,
-                                quality=mapped_read.quality,
-                                alignments=[],
-                            )
-                            parquet_writer.write_read(
-                                read_id=mapped_read.read_id,
-                                read_length=len(mapped_read.sequence),
-                                genome_status=mapped_read.genome_status,
-                                genome_hit_count=mapped_read.genome_hit_count,
-                                alignments=mapped_read.alignments,
-                            )
-                        elif mapped_read.transcript_over_candidate_limit:
-                            # Preserve >N-hit reads as unresolved records, but
-                            # do not expose a truncated candidate set to EM.
-                            multiple_writer.write_read(
-                                read_id=mapped_read.read_id,
-                                sequence=mapped_read.sequence,
-                                quality=mapped_read.quality,
-                                alignments=[],
-                            )
+                batch_output_files.extend(
+                    worker_result.output_files
+                )
 
-                        if displayed_read_count < 20:
-                            logger.info(
-                                "Read=%s length=%d genome_status=%s genome_hits=%d output_hits=%d",
-                                mapped_read.read_id,
-                                len(mapped_read.sequence),
-                                mapped_read.genome_status,
-                                mapped_read.genome_hit_count,
-                                hit_count,
-                            )
-                            displayed_read_count += 1
+            logger.info(
+                "FASTQBatch=%d "
+                "InputReads=%d "
+                "MappedReads=%d "
+                "DecoyFilteredReads=%d "
+                "WorkerChunks=%d "
+                "ChromosomePartFiles=%d "
+                "Elapsed=%.1fs",
+                fastq_batch_index,
+                len(batch),
+                batch_mapped_read_count,
+                batch_decoy_filtered_read_count,
+                len(tasks),
+                len(batch_output_files),
+                time.time() - batch_start,
+            )
 
-                if progress_interval > 0 and total_counters.read_count >= next_progress_count:
-                    elapsed_seconds = time.time() - start_time
-                    reads_per_second = (
-                        total_counters.read_count / elapsed_seconds
-                        if elapsed_seconds > 0 else 0.0
+            if (
+                progress_interval > 0
+                and counters.total_reads
+                >= next_progress
+            ):
+                elapsed = (
+                    time.time()
+                    - start_time
+                )
+
+                speed = (
+                    counters.total_reads
+                    / elapsed
+                    if elapsed > 0
+                    else 0.0
+                )
+
+                logger.info(
+                    "Processed=%d "
+                    "Speed=%.1f reads/s "
+                    "Mapped=%d "
+                    "GroupUnique=%d "
+                    "GroupMulti=%d "
+                    "Unmapped=%d "
+                    "DecoyFiltered=%d "
+                    "BestHitLimitReached=%d",
+                    counters.total_reads,
+                    speed,
+                    counters.mapped_reads,
+                    counters.group_unique_reads,
+                    counters.group_multi_reads,
+                    counters.unmapped_reads,
+                    decoy_filtered_read_count,
+                    counters.best_hit_overflow_reads,
+                )
+
+                while (
+                    next_progress
+                    <= counters.total_reads
+                ):
+                    next_progress += (
+                        progress_interval
                     )
-                    logger.info(
-                        "Processed=%d Speed=%.1f reads/s GenomeUnique=%d "
-                        "TranscriptSingle=%d TranscriptMulti=%d "
-                        "MultiHit2=%d MultiHit3=%d MultiHit4=%d "
-                        "MultiHit5=%d MultiHit6=%d MultiHit7=%d MultiHit8=%d MultiHitOver8=%d "
-                        "Unmapped=%d",
-                        total_counters.read_count,
-                        reads_per_second,
-                        total_counters.genome_unique_count,
-                        total_counters.transcript_single_count,
-                        total_counters.transcript_multi_count,
-                        total_counters.transcript_multihit_2_count,
-                        total_counters.transcript_multihit_3_count,
-                        total_counters.transcript_multihit_4_count,
-                        total_counters.transcript_multihit_5_count,
-                        total_counters.transcript_multihit_6_count,
-                        total_counters.transcript_multihit_7_count,
-                        total_counters.transcript_multihit_8_count,
-                        total_counters.transcript_multihit_over8_count,
-                        total_counters.unmapped_count,
-                    )
-                    while next_progress_count <= total_counters.read_count:
-                        next_progress_count += progress_interval
 
-    elapsed_seconds = time.time() - start_time
-    reads_per_second = (
-        total_counters.read_count / elapsed_seconds
-        if elapsed_seconds > 0 else 0.0
+    elapsed = (
+        time.time()
+        - start_time
     )
-    logger.info("Multiprocess mapping finished")
-    logger.info("Reads: %d", total_counters.read_count)
-    logger.info("Genome unique: %d", total_counters.genome_unique_count)
-    logger.info("Transcript single candidate: %d", total_counters.transcript_single_count)
-    logger.info("Transcript multiple candidates: %d", total_counters.transcript_multi_count)
-    logger.info("TranscriptMulti multihit=2: %d", total_counters.transcript_multihit_2_count)
-    logger.info("TranscriptMulti multihit=3: %d", total_counters.transcript_multihit_3_count)
-    logger.info("TranscriptMulti multihit=4: %d", total_counters.transcript_multihit_4_count)
-    logger.info("TranscriptMulti multihit=5: %d", total_counters.transcript_multihit_5_count)
-    logger.info("TranscriptMulti multihit=6: %d", total_counters.transcript_multihit_6_count)
-    logger.info("TranscriptMulti multihit=7: %d", total_counters.transcript_multihit_7_count)
-    logger.info("TranscriptMulti multihit=8: %d", total_counters.transcript_multihit_8_count)
-    logger.info("TranscriptMulti multihit>8: %d", total_counters.transcript_multihit_over8_count)
-    logger.info("Unmapped: %d", total_counters.unmapped_count)
-    logger.info("Coordinate conversion errors: %d", total_counters.conversion_errors)
-    logger.info("Elapsed seconds: %.1f", elapsed_seconds)
-    logger.info("Average speed: %.1f reads/s", reads_per_second)
+
+    speed = (
+        counters.total_reads
+        / elapsed
+        if elapsed > 0
+        else 0.0
+    )
+
+    logger.info(
+        "Multiprocess transcript mapping finished"
+    )
+    logger.info(
+        "Reads: %d",
+        counters.total_reads,
+    )
+    logger.info(
+        "Mapped: %d",
+        counters.mapped_reads,
+    )
+    logger.info(
+        "Group unique: %d",
+        counters.group_unique_reads,
+    )
+    logger.info(
+        "Group multi: %d",
+        counters.group_multi_reads,
+    )
+    logger.info(
+        "Unmapped: %d",
+        counters.unmapped_reads,
+    )
+    logger.info(
+        "Decoy-filtered reads: %d",
+        decoy_filtered_read_count,
+    )
+    logger.info(
+        "Best-hit limit reached: %d",
+        counters.best_hit_overflow_reads,
+    )
+    logger.info(
+        "Elapsed seconds: %.1f",
+        elapsed,
+    )
+    logger.info(
+        "Average speed: %.1f reads/s",
+        speed,
+    )
+
+    return counters

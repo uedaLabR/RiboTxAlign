@@ -119,7 +119,7 @@ def _run_redistribution(
 ):
     """Run EM redistribution and return its result object."""
 
-    from re_distribute.run_redistribute import run_redistribution
+    from em_distribute.run_redistribute import run_redistribution
 
     Path(_path(output_prefix)).parent.mkdir(parents=True, exist_ok=True)
 

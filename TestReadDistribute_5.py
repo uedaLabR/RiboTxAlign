@@ -1,4 +1,4 @@
-from re_distribute.run_redistribute import run_redistribution
+from em_distribute.run_redistribute import run_redistribution
 
 
 COORDINATE_TSV = (

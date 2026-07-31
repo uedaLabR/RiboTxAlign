@@ -1,125 +1,355 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from pathlib import Path
-from typing import Iterable
+import re
 
-from mapping.mapping_result import ProjectedAlignment
+from mapping.mapping_result import RawAlignment
+from mapping.reference_id import get_group_id
 
 
-class MappingParquetWriter:
-    """Write multi-mapping candidate alignments in bounded Parquet batches."""
+_CIGAR_CODES = {
+    0: "M",
+    1: "I",
+    2: "D",
+    3: "N",
+    4: "S",
+    5: "H",
+    6: "P",
+    7: "=",
+    8: "X",
+}
 
-    def __init__(self, output_parquet: str, batch_size: int = 100000):
+_GROUP_ID_PATTERN = re.compile(
+    r"^(?P<chrom>.+)_(?:plus|minus)_G\d+$",
+    re.IGNORECASE,
+)
+
+
+def cigar_to_string(
+    cigartuples: list[tuple[int, int]],
+) -> str:
+    """Convert CIGAR tuples to a compact CIGAR string."""
+
+    return "".join(
+        f"{length}{_CIGAR_CODES.get(operation, '?')}"
+        for operation, length in cigartuples
+    )
+
+
+def get_chromosome_from_group_id(
+    group_id: str,
+) -> str:
+    """Extract the chromosome name from a group ID.
+
+    Examples
+    --------
+    ``chr1_plus_G00001`` becomes ``chr1``.
+    ``chrX_KI270913v1_alt_minus_G00001`` becomes
+    ``chrX_KI270913v1_alt``.
+    """
+
+    match = _GROUP_ID_PATTERN.fullmatch(
+        group_id
+    )
+
+    if match is None:
+        raise ValueError(
+            "Cannot extract chromosome from group ID: "
+            f"{group_id}"
+        )
+
+    return match.group(
+        "chrom"
+    )
+
+
+def get_mapping_schema():
+    """Return the schema used by all mapping part files."""
+
+    try:
+        import pyarrow as pa
+    except ImportError as error:
+        raise ImportError(
+            "Parquet output requires pyarrow. "
+            "Install it with: pip install pyarrow"
+        ) from error
+
+    return pa.schema(
+        [
+            ("read_id", pa.string()),
+            ("read_length", pa.int32()),
+            ("hit_index", pa.int16()),
+            ("group_index", pa.int16()),
+            ("transcript_id", pa.string()),
+            ("group_id", pa.string()),
+            (
+                "other_group_ids",
+                pa.list_(
+                    pa.string()
+                ),
+            ),
+            ("reference_start", pa.int32()),
+            ("reference_end", pa.int32()),
+            ("query_start", pa.int32()),
+            ("query_end", pa.int32()),
+            ("strand", pa.int8()),
+            ("cigar", pa.string()),
+            ("hit_count", pa.int16()),
+            ("group_count", pa.int16()),
+        ]
+    )
+
+
+def alignments_to_rows(
+    read_id: str,
+    read_length: int,
+    alignments: list[RawAlignment],
+) -> list[dict]:
+    """Convert retained best-tie alignments to one row per hit."""
+
+    if not alignments:
+        raise ValueError(
+            "At least one alignment is required."
+        )
+
+    ordered_alignments = sorted(
+        alignments,
+        key=lambda alignment: (
+            get_group_id(
+                alignment.reference_name
+            ),
+            alignment.reference_name,
+            alignment.reference_start,
+            alignment.reference_end,
+            alignment.strand,
+        ),
+    )
+
+    group_ids = [
+        get_group_id(
+            alignment.reference_name
+        )
+        for alignment in ordered_alignments
+    ]
+
+    candidate_group_ids = list(
+        dict.fromkeys(
+            group_ids
+        )
+    )
+
+    group_index_by_id = {
+        group_id: group_index
+        for group_index, group_id in enumerate(
+            candidate_group_ids
+        )
+    }
+
+    hit_count = len(
+        ordered_alignments
+    )
+    group_count = len(
+        candidate_group_ids
+    )
+
+    rows: list[dict] = []
+
+    for hit_index, (
+        alignment,
+        group_id,
+    ) in enumerate(
+        zip(
+            ordered_alignments,
+            group_ids,
+        )
+    ):
+        rows.append(
+            {
+                "read_id": read_id,
+                "read_length": int(
+                    read_length
+                ),
+                "hit_index": int(
+                    hit_index
+                ),
+                "group_index": int(
+                    group_index_by_id[
+                        group_id
+                    ]
+                ),
+                "transcript_id": (
+                    alignment.reference_name
+                ),
+                "group_id": group_id,
+                "other_group_ids": [
+                    candidate_group_id
+                    for candidate_group_id
+                    in candidate_group_ids
+                    if candidate_group_id
+                    != group_id
+                ],
+                "reference_start": int(
+                    alignment.reference_start
+                ),
+                "reference_end": int(
+                    alignment.reference_end
+                ),
+                "query_start": int(
+                    alignment.query_start
+                ),
+                "query_end": int(
+                    alignment.query_end
+                ),
+                "strand": int(
+                    alignment.strand
+                ),
+                "cigar": cigar_to_string(
+                    alignment.cigartuples
+                ),
+                "hit_count": int(
+                    hit_count
+                ),
+                "group_count": int(
+                    group_count
+                ),
+            }
+        )
+
+    return rows
+
+
+class MappingBatchPartWriter:
+    """Aggregate one FASTQ batch and write one part per chromosome.
+
+    Rows are not sorted here. Each chromosome file is opened, written,
+    and closed once after all worker results for the FASTQ batch have
+    been aggregated.
+    """
+
+    def __init__(
+        self,
+        output_directory: str,
+        batch_index: int,
+        compression: str = "zstd",
+        row_group_size: int = 100000,
+    ) -> None:
+        if batch_index < 0:
+            raise ValueError(
+                "batch_index must not be negative."
+            )
+
+        if row_group_size < 1:
+            raise ValueError(
+                "row_group_size must be at least 1."
+            )
+
+        self.output_directory = Path(
+            output_directory
+        )
+        self.output_directory.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        self.batch_index = batch_index
+        self.compression = compression
+        self.row_group_size = row_group_size
+        self.schema = get_mapping_schema()
+
+        self.rows_by_chromosome: dict[
+            str,
+            list[dict],
+        ] = defaultdict(
+            list
+        )
+
+    def add_read(
+        self,
+        read_id: str,
+        read_length: int,
+        alignments: list[RawAlignment],
+    ) -> None:
+        """Add all retained hits of one read to this FASTQ batch."""
+
+        for row in alignments_to_rows(
+            read_id=read_id,
+            read_length=read_length,
+            alignments=alignments,
+        ):
+            chromosome = (
+                get_chromosome_from_group_id(
+                    row[
+                        "group_id"
+                    ]
+                )
+            )
+
+            self.rows_by_chromosome[
+                chromosome
+            ].append(
+                row
+            )
+
+    def write_and_close(
+        self,
+    ) -> list[Path]:
+        """Write one unsorted part file per represented chromosome."""
+
         try:
             import pyarrow as pa
             import pyarrow.parquet as pq
         except ImportError as error:
             raise ImportError(
-                "Writing mapping candidates to Parquet requires pyarrow. "
+                "Parquet output requires pyarrow. "
                 "Install it with: pip install pyarrow"
             ) from error
 
-        if batch_size < 1:
-            raise ValueError("batch_size must be at least 1.")
+        output_files: list[Path] = []
 
-        self.pa = pa
-        self.pq = pq
-        self.output_parquet = Path(output_parquet)
-        self.output_parquet.parent.mkdir(parents=True, exist_ok=True)
-        self.batch_size = batch_size
-        self.rows: list[dict] = []
-        self.writer = None
+        for chromosome in sorted(
+            self.rows_by_chromosome
+        ):
+            rows = self.rows_by_chromosome[
+                chromosome
+            ]
 
-    def write_read(
-        self,
-        read_id: str,
-        read_length: int,
-        genome_status: str,
-        genome_hit_count: int,
-        alignments: Iterable[ProjectedAlignment],
-    ) -> None:
-        alignments = list(alignments)
-        hit_count = len(alignments)
+            if not rows:
+                continue
 
-        for hit_index, alignment in enumerate(alignments, start=1):
-            self.rows.append(
-                {
-                    "read_id": read_id,
-                    "read_length": int(read_length),
-                    "genome_status": genome_status,
-                    "genome_hit_count": int(genome_hit_count),
-                    # Counts are based on distinct genomic placements after
-                    # transcript hits have been projected and deduplicated.
-                    "candidate_count": int(hit_count),
-                    "genomic_hit_count": int(hit_count),
-                    "candidate_index": int(hit_index),
-                    "genomic_hit_index": int(hit_index),
-                    "gene_id": alignment.gene_id,
-                    "record_type": alignment.record_type,
-                    "source_reference": alignment.source_reference,
-                    "source_reference_start": int(alignment.source_reference_start),
-                    "source_reference_end": int(alignment.source_reference_end),
-                    "chrom": alignment.chrom,
-                    "reference_start": int(alignment.reference_start),
-                    "genomic_blocks": _blocks_to_string(alignment.genomic_blocks),
-                    "is_reverse": bool(alignment.is_reverse),
-                    "mapq": int(alignment.mapq),
-                    "edit_distance": int(alignment.edit_distance),
-                    "score": int(alignment.score),
-                    "cigar": _cigar_to_string(alignment.cigartuples),
-                    "support_sources": ",".join(sorted(alignment.support_sources)),
-                }
+            output_path = (
+                self.output_directory
+                / (
+                    f"{chromosome}."
+                    f"part{self.batch_index:06d}."
+                    "parquet"
+                )
             )
 
-        if len(self.rows) >= self.batch_size:
-            self.flush()
+            if output_path.exists():
+                raise FileExistsError(
+                    "Mapping part already exists: "
+                    f"{output_path}"
+                )
 
-    def flush(self) -> None:
-        if not self.rows:
-            return
-
-        table = self.pa.Table.from_pylist(self.rows)
-
-        if self.writer is None:
-            self.writer = self.pq.ParquetWriter(
-                str(self.output_parquet),
-                table.schema,
-                compression="zstd",
+            table = pa.Table.from_pylist(
+                rows,
+                schema=self.schema,
             )
 
-        self.writer.write_table(table)
-        self.rows.clear()
+            pq.write_table(
+                table,
+                output_path,
+                compression=self.compression,
+                row_group_size=(
+                    self.row_group_size
+                ),
+            )
 
-    def close(self) -> None:
-        self.flush()
-        if self.writer is not None:
-            self.writer.close()
-            self.writer = None
+            output_files.append(
+                output_path
+            )
 
-    def __enter__(self) -> "MappingParquetWriter":
-        return self
+        self.rows_by_chromosome.clear()
 
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
-        self.close()
-
-
-def _cigar_to_string(cigartuples: list[tuple[int, int]]) -> str:
-    operation_codes = {
-        0: "M",
-        1: "I",
-        2: "D",
-        3: "N",
-        4: "S",
-        5: "H",
-        6: "P",
-        7: "=",
-        8: "X",
-    }
-    return "".join(
-        f"{length}{operation_codes.get(operation, '?')}"
-        for operation, length in cigartuples
-    )
-
-
-def _blocks_to_string(blocks: tuple[tuple[int, int], ...]) -> str:
-    return ",".join(f"{start}-{end}" for start, end in blocks)
+        return output_files

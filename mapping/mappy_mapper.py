@@ -6,33 +6,31 @@ from mapping.mapping_result import RawAlignment
 
 
 class MappyMapper:
-    """
-    Map single-end Ribo-seq reads with mappy.
-    """
+    """Map single-end Ribo-seq reads against a transcript reference."""
 
     def __init__(
         self,
         reference_path: str,
-        source: str,
         preset: str = "sr",
-        kmer_size: int = 9,
+        kmer_size: int = 11,
         window_size: int = 5,
         minimum_minimizers: int = 2,
         minimum_chain_score: int = 15,
         minimum_dp_score: int = 15,
-        maximum_hits: int = 5,
-        index_threads: int = 4,
+        maximum_candidates: int = 16,
+        index_threads: int = 1,
         minimum_query_coverage: float = 0.85,
         minimum_identity: float = 0.90,
-    ):
-        self.source = source
-        self.minimum_query_coverage = (
-            minimum_query_coverage
-        )
-        self.minimum_identity = (
-            minimum_identity
-        )
+    ) -> None:
+        if maximum_candidates < 1:
+            raise ValueError("maximum_candidates must be at least 1.")
 
+        self.maximum_candidates = maximum_candidates
+        self.minimum_query_coverage = minimum_query_coverage
+        self.minimum_identity = minimum_identity
+
+        # Request one extra candidate so a best-score overflow can be
+        # detected when more than maximum_candidates equal best hits exist.
         self.aligner = mp.Aligner(
             reference_path,
             preset=preset,
@@ -41,7 +39,7 @@ class MappyMapper:
             min_cnt=minimum_minimizers,
             min_chain_score=minimum_chain_score,
             min_dp_score=minimum_dp_score,
-            best_n=maximum_hits,
+            best_n=maximum_candidates + 1,
             n_threads=index_threads,
         )
 
@@ -57,13 +55,16 @@ class MappyMapper:
         self,
         read_id: str,
         sequence: str,
-    ) -> list[RawAlignment]:
-        """
-        Map one read and return filtered candidates.
+    ) -> tuple[list[RawAlignment], bool]:
+        """Return best-score ties and whether they exceeded the limit.
+
+        Query coverage and identity filters are applied first. Among the
+        surviving alignments, only alignments with the maximum internal score
+        are retained. Lower-scoring alignments are discarded.
         """
 
         read_length = len(sequence)
-        alignments: list[RawAlignment] = []
+        filtered: list[RawAlignment] = []
 
         for hit in self.aligner.map(
             sequence,
@@ -73,60 +74,47 @@ class MappyMapper:
         ):
             alignment = RawAlignment(
                 read_id=read_id,
-                source=self.source,
                 reference_name=hit.ctg,
                 reference_start=hit.r_st,
                 reference_end=hit.r_en,
                 query_start=hit.q_st,
                 query_end=hit.q_en,
                 strand=hit.strand,
-                mapq=hit.mapq,
                 matching_bases=hit.mlen,
                 alignment_length=hit.blen,
                 edit_distance=hit.NM,
-                is_primary=hit.is_primary,
-
-                # mappy:
-                #     (length, operation)
-                #
-                # pysam:
-                #     (operation, length)
                 cigartuples=[
-                    (
-                        operation,
-                        length,
-                    )
-                    for length, operation
-                    in hit.cigar
+                    (operation, length)
+                    for length, operation in hit.cigar
                 ],
             )
 
-            if (
-                alignment.query_coverage(
-                    read_length
-                )
-                < self.minimum_query_coverage
-            ):
+            if alignment.query_coverage(read_length) < self.minimum_query_coverage:
                 continue
 
-            if (
-                alignment.identity
-                < self.minimum_identity
-            ):
+            if alignment.identity < self.minimum_identity:
                 continue
 
-            alignments.append(
-                alignment
+            filtered.append(alignment)
+
+        if not filtered:
+            return [], False
+
+        best_score = max(alignment.score for alignment in filtered)
+        best_hits = [
+            alignment
+            for alignment in filtered
+            if alignment.score == best_score
+        ]
+
+        best_hits.sort(
+            key=lambda alignment: (
+                alignment.reference_name,
+                alignment.reference_start,
+                alignment.reference_end,
+                alignment.strand,
             )
-
-        alignments.sort(
-            key=lambda item: (
-                item.score,
-                item.mapq,
-                item.matching_bases,
-                item.is_primary,
-            ),
-            reverse=True,
         )
 
-        return alignments
+        overflow = len(best_hits) > self.maximum_candidates
+        return best_hits[: self.maximum_candidates], overflow

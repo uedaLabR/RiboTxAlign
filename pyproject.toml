@@ -30,3 +30,8 @@ py-modules = ["RiboTxAlign_Cmd"]
 where = ["."]
 include = ["db_construct*", "mapping*", "re_distribute*"]
 namespaces = true
+
+[project.urls]
+Homepage = "https://github.com/uedaLabR/RiboTxAlign"
+Repository = "https://github.com/uedaLabR/RiboTxAlign.git"
+Issues = "https://github.com/uedaLabR/RiboTxAlign/issues"
