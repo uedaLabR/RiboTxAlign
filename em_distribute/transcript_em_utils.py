@@ -56,6 +56,45 @@ def calculate_group_probability(
     ) / total_tpm
 
 
+def process_single_transcript_group(
+    group_id,
+    transcript_id,
+    group_records,
+    group_tpm,
+    reads_info,
+    transcript_tpm,
+):
+    """Process a group containing only one transcript."""
+
+    transcript_tpm[transcript_id] = group_tpm[group_id]
+
+    for record in group_records:
+        other_group_ids = record.get(
+            "other_group_ids",
+            [],
+        )
+
+        if other_group_ids is None:
+            other_group_ids = []
+
+        prior_probability = calculate_group_probability(
+            group_id=group_id,
+            other_group_ids=other_group_ids,
+            group_tpm=group_tpm,
+        )
+
+        reads_info.append(
+            {
+                "group_id": group_id,
+                "transcript_id": transcript_id,
+                "read_id": record["read_id"],
+                "start": record["reference_start"],
+                "end": record["reference_end"],
+                "prior_probability": prior_probability,
+                "transcript_probability": 1.0,
+            }
+        )
+
 def write_reads_info(
     reads_info,
     output_parquet,
@@ -103,3 +142,56 @@ def write_transcript_tpm(
                     tpm,
                 ]
             )
+
+import csv
+from pathlib import Path
+
+
+def append_transcript_merge_log(
+    group_id,
+    merge_map,
+    output_tsv,
+):
+    """Append transcript merge relationships to a TSV file."""
+
+    output_path = Path(output_tsv)
+    output_path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    write_header = (
+        not output_path.exists()
+        or output_path.stat().st_size == 0
+    )
+
+    with output_path.open(
+        "a",
+        encoding="utf-8",
+        newline="",
+    ) as handle:
+        writer = csv.writer(
+            handle,
+            delimiter="\t",
+        )
+
+        if write_header:
+            writer.writerow(
+                [
+                    "group_id",
+                    "source_transcript_id",
+                    "target_transcript_id",
+                ]
+            )
+
+        for source_id, target_id in merge_map.items():
+            writer.writerow(
+                [
+                    group_id,
+                    source_id,
+                    target_id,
+                ]
+            )
+
+        handle.flush()
+

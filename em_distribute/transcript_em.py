@@ -63,59 +63,28 @@ import pyarrow.parquet as pq
 
 
 
-def process_single_transcript_group(
-    group_id,
-    transcript_id,
-    group_records,
-    group_tpm,
-    reads_info,
-    transcript_tpm,
-):
-    """Process a group containing only one transcript."""
 
-    transcript_tpm[transcript_id] = group_tpm[group_id]
-
-    for record in group_records:
-        other_group_ids = record.get(
-            "other_group_ids",
-            [],
-        )
-
-        if other_group_ids is None:
-            other_group_ids = []
-
-        prior_probability = calculate_group_probability(
-            group_id=group_id,
-            other_group_ids=other_group_ids,
-            group_tpm=group_tpm,
-        )
-
-        reads_info.append(
-            {
-                "group_id": group_id,
-                "transcript_id": transcript_id,
-                "read_id": record["read_id"],
-                "start": record["reference_start"],
-                "end": record["reference_end"],
-                "prior_probability": prior_probability,
-                "transcript_probability": 1.0,
-            }
-        )
 
 
 from em_distribute.transcript_group_multi import (
     process_multi_transcript_group,
 )
 
-
+from em_distribute.reference_utils import *
 def em_transcript(
     group_em_tsv: str | Path,
     sorted_mapping_dir: str | Path,
     reads_info_parquet: str | Path,
     transcript_tpm_tsv: str | Path,
+    transcript_merge_log_tsv: str | Path,
+    reference_metadata_tsv: str | Path,
+
 ):
     group_tpm = load_group_tpm(
         group_em_tsv
+    )
+    reference_definitions = load_reference_metadata(
+        reference_metadata_tsv
     )
 
     reads_info = []
@@ -168,6 +137,8 @@ def em_transcript(
                 group_tpm=group_tpm,
                 reads_info=reads_info,
                 transcript_tpm=transcript_tpm,
+                transcript_merge_log_tsv=transcript_merge_log_tsv,
+                reference_definitions=reference_definitions
             )
         else:
             print("error not transcript found in group -- should not happen")

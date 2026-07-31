@@ -122,6 +122,90 @@ def find_subset_merges(
 
     return merge_map
 
+
+def merge_transcripts(
+    group_id,
+    transcript_ids,
+    group_records,
+    merge_map,
+):
+    """Apply transcript merges and remove duplicate read-transcript hits."""
+
+    before_transcript_count = len(
+        transcript_ids
+    )
+
+    merged_group_records = apply_transcript_merges(
+        group_records=group_records,
+        merge_map=merge_map,
+    )
+
+    merged_transcript_ids = {
+        record["transcript_id"]
+        for record in merged_group_records
+    }
+
+    after_transcript_count = len(
+        merged_transcript_ids
+    )
+
+    print(
+        "transcript merge",
+        group_id,
+        "before",
+        before_transcript_count,
+        "after",
+        after_transcript_count,
+        "reduced",
+        before_transcript_count - after_transcript_count,
+    )
+
+    return (
+        merged_transcript_ids,
+        merged_group_records,
+    )
+
+
+def apply_transcript_merges(
+    group_records,
+    merge_map,
+):
+    """Apply transcript merges and remove duplicate read-transcript hits."""
+
+    merged_records = []
+    seen_hits = set()
+
+    for record in group_records:
+        transcript_id = merge_map.get(
+            record["transcript_id"],
+            record["transcript_id"],
+        )
+
+        hit_key = (
+            record["read_id"],
+            transcript_id,
+        )
+
+        if hit_key in seen_hits:
+            continue
+
+        seen_hits.add(hit_key)
+
+        updated_record = record.copy()
+        updated_record["transcript_id"] = transcript_id
+
+        merged_records.append(
+            updated_record
+        )
+
+    return merged_records
+
+from em_distribute.transcript_em_utils import *
+from em_distribute.reference_utils import *
+from em_distribute.transcript_em_eachgroup import (
+    execute_transcript_em_eachgroup,
+)
+
 def process_multi_transcript_group(
     group_id,
     transcript_ids,
@@ -129,6 +213,8 @@ def process_multi_transcript_group(
     group_tpm,
     reads_info,
     transcript_tpm,
+    transcript_merge_log_tsv,
+    reference_definitions,
 ):
     """Process a group containing multiple transcripts."""
 
@@ -140,40 +226,60 @@ def process_multi_transcript_group(
         group_records
     )
 
-    for transcript_id in transcript_ids:
-        transcript_unique_reads = (
-            unique_read_indexes.get(
-                transcript_id,
-                set(),
-            )
-        )
-
-        transcript_multi_reads = (
-            multi_read_indexes.get(
-                transcript_id,
-                set(),
-            )
-        )
-
-        print(
-            group_id,
-            transcript_id,
-            "unique",
-            len(transcript_unique_reads),
-            "multi",
-            len(transcript_multi_reads),
-        )
-
-    #find transcript only supoorted by multimap
     merge_map = find_subset_merges(
-        transcript_ids,
-        unique_read_indexes,
-        multi_read_indexes,
+        transcript_ids=transcript_ids,
+        unique_read_indexes=unique_read_indexes,
+        multi_read_indexes=multi_read_indexes,
     )
-    print("merge_map",merge_map)
 
-    return (
-        unique_read_indexes,
-        multi_read_indexes,
-        index_to_read_id,
+    if merge_map:
+
+        append_transcript_merge_log(
+            group_id=group_id,
+            merge_map=merge_map,
+            output_tsv=transcript_merge_log_tsv,
+        )
+
+        (
+            transcript_ids,
+            group_records,
+        ) = merge_transcripts(
+            group_id=group_id,
+            transcript_ids=transcript_ids,
+            group_records=group_records,
+            merge_map=merge_map,
+        )
+
+        # The group became a single-transcript group after merging.
+        if len(transcript_ids) == 1:
+            transcript_id = next(
+                iter(transcript_ids)
+            )
+
+            process_single_transcript_group(
+                group_id=group_id,
+                transcript_id=transcript_id,
+                group_records=group_records,
+                group_tpm=group_tpm,
+                reads_info=reads_info,
+                transcript_tpm=transcript_tpm,
+            )
+            return
+
+    transcript_cds_lengths = determine_transcript_lengths(
+        transcript_ids=transcript_ids,
+        group_records=group_records,
+        reference_definitions=reference_definitions,
+        minimum_mapped_reads=10,
+    )
+
+    # Transcript-level EM will start from here.
+    execute_transcript_em_eachgroup(
+        group_id=group_id,
+        transcript_ids=transcript_ids,
+        group_records=group_records,
+        group_tpm=group_tpm,
+        transcript_cds_lengths=transcript_cds_lengths,
+        reads_info=reads_info,
+        transcript_tpm=transcript_tpm,
     )
