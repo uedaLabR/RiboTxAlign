@@ -31,6 +31,7 @@ def build_transcript_reference(
     stringtie_gtf: str,
     genome_fasta: str,
     output_prefix: str,
+    decoy_directory: str | Path | None = None,
 ):
     """Build a transcript-only reference for RiboTxAlign."""
 
@@ -132,6 +133,7 @@ def build_transcript_reference(
         ),
         genome_fasta=genome_fasta,
         output_path=output_fasta,
+        decoy_directory=decoy_directory,
     )
 
     print("8. Write metadata table.")

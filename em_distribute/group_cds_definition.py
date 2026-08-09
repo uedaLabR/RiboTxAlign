@@ -10,7 +10,10 @@ from typing import TextIO
 
 @dataclass(slots=True)
 class ReferenceCdsDefinition:
-    """CDS intervals associated with one mapping reference."""
+    """Length and CDS information for one mapping reference."""
+
+    transcript_length: int = 0
+    annotated_cds_length: int = 0
 
     gencode_transcript_ids: set[str] = field(
         default_factory=set
@@ -253,14 +256,38 @@ def load_reference_definitions(
                     source_reference_id
                 )
 
+            transcript_length_text = (
+                row.get("transcript_length")
+                or "0"
+            ).strip()
+
+            cds_length_text = (
+                row.get("cds_length")
+                or "0"
+            ).strip()
+
+            transcript_length = int(
+                transcript_length_text
+            ) if transcript_length_text else 0
+
+            annotated_cds_length = int(
+                cds_length_text
+            ) if cds_length_text else 0
+
             group_definitions.setdefault(
                 group_id,
                 {},
             )[reference_id] = (
                 ReferenceCdsDefinition(
+                    transcript_length=(
+                        transcript_length
+                    ),
+                    annotated_cds_length=(
+                        annotated_cds_length
+                    ),
                     gencode_transcript_ids=(
                         gencode_transcript_ids
-                    )
+                    ),
                 )
             )
 

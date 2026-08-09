@@ -39,6 +39,11 @@ def main() -> None:
         write_batch_size=100000,
         worker_count=4,
         overwrite=True,
+        minimum_mapped_reads=10,
+        minimum_mapped_span=100,
+        minimum_transcript_fraction=(
+            1.0 / 3.0
+        ),
     )
 
 if __name__ == "__main__":

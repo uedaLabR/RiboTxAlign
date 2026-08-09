@@ -23,5 +23,6 @@ if __name__ == "__main__":
         reads_info_parquet="/mnt/share/project/riboML/sample_ref/transcript_reads_info.parquet",
         transcript_tpm_tsv="/mnt/share/project/riboML/sample_ref/transcript_tpm.tsv",
         transcript_merge_log_tsv="/mnt/share/project/riboML/sample_ref/transcript_merge_log_tsv",
-        reference_metadata_tsv="/mnt/share/project/riboML/sample_ref/HEK293T_RiboTxAlign.metadata.tsv"
+        reference_metadata_tsv="/mnt/share/project/riboML/sample_ref/HEK293T_RiboTxAlign.metadata.tsv",
+        reference_gtf = "/mnt/share/project/riboML/sample_ref/HEK293T_RiboTxAlign.gtf"
     )

@@ -4,9 +4,9 @@ from mapping.map_read_mt import run_transcript_mapping_to_parquet_mt
 
 
 RIBO_FASTQ = (
-    "/mnt/share/project/riboML/riboseq_raw/trimmed_26_34/"
-    "SRR26942051.26_34.fastq.gz"
+    "/mnt/share/project/riboML/riboseq_raw/trimmed_26_34/deduplicated/SRR26942051.26_34.deduplicated.fastq.gz"
 )
+
 TRANSCRIPT_FASTA = (
     "/mnt/share/project/riboML/sample_ref/"
     "HEK293T_RiboTxAlign.fa"
@@ -15,6 +15,16 @@ MAPPING_PARTS_DIRECTORY = (
     "/mnt/share/project/riboML/sample_ref/"
     "mapping_parts"
 )
+UNMAPPED_FASTQ = (
+    "/mnt/share/project/riboML/sample_ref/"
+    "HEK293T_RiboTxAlign.unmapped.fastq.gz"
+)
+
+STATS_JSON = (
+    "/mnt/share/project/riboML/sample_ref/"
+    "HEK293T_RiboTxAlign.mapping_stats.json"
+)
+
 LOG_FILE = (
     "/mnt/share/project/riboML/sample_ref/"
     "HEK293T_RiboTxAlign.mapping_mt.log"
@@ -41,5 +51,7 @@ if __name__ == "__main__":
         progress_interval=100000,
         parquet_row_group_size=100000,
         log_file=LOG_FILE,
+        unmapped_fastq_path=UNMAPPED_FASTQ,
+        stats_json_path=STATS_JSON,
     )
 

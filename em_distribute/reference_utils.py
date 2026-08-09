@@ -3,9 +3,7 @@ from collections import defaultdict
 from pathlib import Path
 
 
-def load_reference_metadata(
-    metadata_tsv,
-):
+def load_reference_metadata(metadata_tsv):
     """Load reference transcript definitions from metadata TSV."""
 
     reference_definitions = {}
@@ -26,25 +24,174 @@ def load_reference_metadata(
             reference_definitions[reference_id] = {
                 "reference_id": reference_id,
                 "group_id": row["overlap_group_id"],
-                "transcript_length": int(
-                    row["transcript_length"]
-                ),
-                "cds_length": int(
-                    row["cds_length"]
-                ),
-                "representative_transcript_id": row[
-                    "representative_transcript_id"
-                ],
-                "gencode_transcript_ids": [
-                    value
-                    for value in row[
-                        "gencode_transcript_ids"
-                    ].split(",")
-                    if value
-                ],
+                "transcript_length": int(row["transcript_length"]),
+                "cds_length": int(row["cds_length"]),
+                "exons": [],
             }
 
     return reference_definitions
+
+
+def load_reference_exons(reference_gtf, reference_definitions):
+    """Add exon intervals from the existing reference GTF."""
+
+    with Path(reference_gtf).open(
+        "r",
+        encoding="utf-8",
+    ) as handle:
+        for line in handle:
+            if line.startswith("#"):
+                continue
+
+            columns = line.rstrip("\n").split("\t")
+
+            if len(columns) != 9 or columns[2] != "exon":
+                continue
+
+            attributes = {}
+
+            for item in columns[8].split(";"):
+                item = item.strip()
+
+                if not item or " " not in item:
+                    continue
+
+                key, value = item.split(" ", 1)
+                attributes[key] = value.strip().strip('"')
+
+            transcript_id = attributes.get("transcript_id")
+
+            if transcript_id not in reference_definitions:
+                continue
+
+            reference_definitions[transcript_id]["exons"].append(
+                (
+                    int(columns[3]) - 1,
+                    int(columns[4]),
+                )
+            )
+
+    for definition in reference_definitions.values():
+        definition["exons"].sort()
+
+    return reference_definitions
+
+
+def load_reference_definitions(
+    metadata_tsv,
+    reference_gtf,
+):
+    """Load reference metadata and exon definitions."""
+
+    definitions = load_reference_metadata(metadata_tsv)
+
+    return load_reference_exons(
+        reference_gtf=reference_gtf,
+        reference_definitions=definitions,
+    )
+
+
+def merge_intervals(intervals):
+    """Merge overlapping half-open intervals."""
+
+    if not intervals:
+        return []
+
+    merged = [list(interval) for interval in sorted(intervals)]
+    output = [merged[0]]
+
+    for start, end in merged[1:]:
+        if start <= output[-1][1]:
+            output[-1][1] = max(output[-1][1], end)
+        else:
+            output.append([start, end])
+
+    return output
+
+
+def calculate_unique_exon_length(own_exons, other_exons):
+    """Return exon length not covered by other transcripts."""
+
+    other_exons = merge_intervals(other_exons)
+    unique_length = 0
+
+    for own_start, own_end in own_exons:
+        overlap_length = 0
+
+        for other_start, other_end in other_exons:
+            if other_end <= own_start:
+                continue
+            if other_start >= own_end:
+                break
+
+            overlap_length += max(
+                0,
+                min(own_end, other_end)
+                - max(own_start, other_start),
+            )
+
+        unique_length += own_end - own_start - overlap_length
+
+    return unique_length
+
+
+def get_junctions(exons):
+    """Return splice junctions from ordered exon intervals."""
+
+    exons = sorted(exons)
+
+    return {
+        (exons[index][1], exons[index + 1][0])
+        for index in range(len(exons) - 1)
+    }
+
+
+def determine_unique_transcript_lengths(
+    transcript_ids,
+    reference_definitions,
+    unique_junction_length=50,
+):
+    """Calculate approximate transcript-unique effective lengths."""
+
+    transcript_ids = list(transcript_ids)
+    junctions = {
+        transcript_id: get_junctions(
+            reference_definitions[transcript_id]["exons"]
+        )
+        for transcript_id in transcript_ids
+    }
+
+    unique_lengths = {}
+
+    for transcript_id in transcript_ids:
+        own_exons = reference_definitions[transcript_id]["exons"]
+        other_exons = [
+            exon
+            for other_id in transcript_ids
+            if other_id != transcript_id
+            for exon in reference_definitions[other_id]["exons"]
+        ]
+        other_junctions = {
+            junction
+            for other_id in transcript_ids
+            if other_id != transcript_id
+            for junction in junctions[other_id]
+        }
+
+        unique_exon_length = calculate_unique_exon_length(
+            own_exons=own_exons,
+            other_exons=other_exons,
+        )
+        unique_junction_count = len(
+            junctions[transcript_id] - other_junctions
+        )
+
+        unique_lengths[transcript_id] = (
+            unique_exon_length
+            + unique_junction_count * unique_junction_length
+        )
+
+    return unique_lengths
 
 
 def determine_transcript_lengths(
@@ -52,49 +199,36 @@ def determine_transcript_lengths(
     group_records,
     reference_definitions,
     minimum_mapped_reads=10,
+    minimum_mapped_span=100,
+    minimum_transcript_fraction=1.0 / 3.0,
 ):
-    """Determine lengths used for transcript-level EM."""
+    """Determine CDS-like lengths used after EM initialization."""
 
     records_by_transcript = defaultdict(list)
 
     for record in group_records:
-        records_by_transcript[
-            record["transcript_id"]
-        ].append(record)
+        records_by_transcript[record["transcript_id"]].append(record)
 
     transcript_lengths = {}
 
     for transcript_id in transcript_ids:
-        definition = reference_definitions[
-            transcript_id
-        ]
-
-        annotated_cds_length = definition[
-            "cds_length"
-        ]
+        definition = reference_definitions[transcript_id]
+        annotated_cds_length = definition["cds_length"]
 
         if annotated_cds_length > 0:
-            transcript_lengths[
-                transcript_id
-            ] = annotated_cds_length
+            transcript_lengths[transcript_id] = annotated_cds_length
             continue
 
-        transcript_records = records_by_transcript.get(
-            transcript_id,
-            [],
-        )
-
+        transcript_records = records_by_transcript.get(transcript_id, [])
         distinct_read_count = len(
-            {
-                record["read_id"]
-                for record in transcript_records
-            }
+            {record["read_id"] for record in transcript_records}
+        )
+        transcript_length = max(
+            int(definition["transcript_length"]),
+            1,
         )
 
-        if (
-            distinct_read_count > minimum_mapped_reads
-            and transcript_records
-        ):
+        if transcript_records:
             mapped_start = min(
                 int(record["reference_start"])
                 for record in transcript_records
@@ -103,19 +237,20 @@ def determine_transcript_lengths(
                 int(record["reference_end"])
                 for record in transcript_records
             )
-
-            transcript_lengths[
-                transcript_id
-            ] = max(
-                mapped_end - mapped_start,
-                1,
-            )
+            mapped_span = max(mapped_end - mapped_start, 1)
         else:
-            transcript_lengths[
-                transcript_id
-            ] = max(
-                definition["transcript_length"],
-                1,
-            )
+            mapped_span = 0
+
+        use_mapped_span = (
+            distinct_read_count > minimum_mapped_reads
+            and mapped_span >= minimum_mapped_span
+            and mapped_span >= transcript_length * minimum_transcript_fraction
+        )
+
+        transcript_lengths[transcript_id] = (
+            mapped_span
+            if use_mapped_span
+            else transcript_length
+        )
 
     return transcript_lengths

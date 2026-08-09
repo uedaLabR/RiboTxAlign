@@ -19,8 +19,8 @@ result = run_group_em(
         "/mnt/share/project/riboML/"
         "sample_ref/group_em.log"
     ),
-    trial_count=200,
-    convergence_threshold=5.0,
+    trial_count=300,
+    convergence_threshold=60.0,
     read_length=32,
     batch_size=100000,
 )

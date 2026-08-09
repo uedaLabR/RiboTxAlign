@@ -10,6 +10,8 @@ from multiprocessing import (
     get_context,
 )
 from pathlib import Path
+import gzip
+import shutil
 
 from mapping.common import (
     MappingCounters,
@@ -18,6 +20,10 @@ from mapping.common import (
     read_fastq_batches,
 )
 from mapping.mappy_mapper import MappyMapper
+from mapping.mapping_stats import (
+    percentage,
+    write_mapping_stats,
+)
 from mapping.parquet_writer import (
     MappingBatchPartWriter,
 )
@@ -39,6 +45,7 @@ class WorkerTask:
     parquet_row_group_size: int
     exclude_decoy_reads: bool
     decoy_reference_patterns: tuple[str, ...]
+    unmapped_fastq_part: str | None
 
 
 @dataclass(slots=True)
@@ -49,6 +56,7 @@ class WorkerResult:
     mapped_read_count: int
     decoy_filtered_read_count: int
     output_files: list[str]
+    unmapped_fastq_part: str | None
 
 
 def _get_reference_chromosome(
@@ -192,54 +200,73 @@ def map_and_write_chunk(
 
     mapped_read_count = 0
     decoy_filtered_read_count = 0
+    unmapped_handle = None
 
-    for read in task.reads:
-        counters.total_reads += 1
+    if task.unmapped_fastq_part is not None:
+        unmapped_part_path = Path(task.unmapped_fastq_part)
+        unmapped_part_path.parent.mkdir(parents=True, exist_ok=True)
+        unmapped_handle = gzip.open(
+            unmapped_part_path,
+            "wt",
+            encoding="utf-8",
+            newline="",
+        )
 
-        alignments, limit_reached = (
-            _WORKER_MAPPER.map_read(
+    try:
+        for read in task.reads:
+            counters.total_reads += 1
+
+            alignments, limit_reached = (
+                _WORKER_MAPPER.map_read(
+                    read_id=read.read_id,
+                    sequence=read.sequence,
+                )
+            )
+
+            if limit_reached:
+                counters.best_hit_overflow_reads += 1
+
+            if not alignments:
+                counters.unmapped_reads += 1
+
+                if unmapped_handle is not None:
+                    quality = read.quality
+                    if quality is None:
+                        quality = "I" * len(read.sequence)
+                    unmapped_handle.write(
+                        f"@{read.read_id}\n"
+                        f"{read.sequence}\n"
+                        "+\n"
+                        f"{quality}\n"
+                    )
+                continue
+
+            if (
+                task.exclude_decoy_reads
+                and _contains_decoy_hit(
+                    alignments,
+                    task.decoy_reference_patterns,
+                )
+            ):
+                decoy_filtered_read_count += 1
+                continue
+
+            counters.mapped_reads += 1
+            mapped_read_count += 1
+
+            writer.add_read(
                 read_id=read.read_id,
-                sequence=read.sequence,
+                read_length=len(read.sequence),
+                alignments=alignments,
             )
-        )
 
-        if limit_reached:
-            counters.best_hit_overflow_reads += 1
-
-        if not alignments:
-            counters.unmapped_reads += 1
-            continue
-
-        if (
-            task.exclude_decoy_reads
-            and _contains_decoy_hit(
-                alignments,
-                task.decoy_reference_patterns,
-            )
-        ):
-            decoy_filtered_read_count += 1
-            continue
-
-        counters.mapped_reads += 1
-        mapped_read_count += 1
-
-        writer.add_read(
-            read_id=read.read_id,
-            read_length=len(
-                read.sequence
-            ),
-            alignments=alignments,
-        )
-
-        if (
-            _count_candidate_groups(
-                alignments
-            )
-            == 1
-        ):
-            counters.group_unique_reads += 1
-        else:
-            counters.group_multi_reads += 1
+            if _count_candidate_groups(alignments) == 1:
+                counters.group_unique_reads += 1
+            else:
+                counters.group_multi_reads += 1
+    finally:
+        if unmapped_handle is not None:
+            unmapped_handle.close()
 
     output_paths = writer.write_and_close()
 
@@ -252,12 +279,10 @@ def map_and_write_chunk(
             decoy_filtered_read_count
         ),
         output_files=[
-            str(
-                output_path
-            )
-            for output_path
-            in output_paths
+            str(output_path)
+            for output_path in output_paths
         ],
+        unmapped_fastq_part=task.unmapped_fastq_part,
     )
 
 
@@ -313,9 +338,11 @@ def run_transcript_mapping_to_parquet_mt(
     parquet_row_group_size: int = 100000,
     exclude_decoy_reads: bool = True,
     decoy_reference_patterns: str = (
-        "chrUn_*,*_random"
+        "chrUn_*,*_random,DECOY_*"
     ),
     log_file: str | None = None,
+    unmapped_fastq_path: str | None = None,
+    stats_json_path: str | None = None,
     multiprocessing_start_method: str = "spawn",
 ) -> MappingCounters:
     """
@@ -419,14 +446,31 @@ def run_transcript_mapping_to_parquet_mt(
     )
     logger.info(
         "Decoy reference patterns: %s",
-        ",".join(
-            parsed_decoy_reference_patterns
-        ),
+        ",".join(parsed_decoy_reference_patterns),
     )
+    logger.info(
+        "Unmapped FASTQ: %s",
+        unmapped_fastq_path if unmapped_fastq_path is not None else "disabled",
+    )
+
+    unmapped_parts_directory = None
+    if unmapped_fastq_path is not None:
+        unmapped_destination = Path(unmapped_fastq_path)
+        unmapped_destination.parent.mkdir(parents=True, exist_ok=True)
+        unmapped_parts_directory = (
+            unmapped_destination.parent
+            / f".{unmapped_destination.name}.parts"
+        )
+        if unmapped_parts_directory.exists():
+            shutil.rmtree(unmapped_parts_directory)
+        unmapped_parts_directory.mkdir(parents=True, exist_ok=True)
 
     context = get_context(
         multiprocessing_start_method
     )
+
+    if unmapped_fastq_path is not None:
+        Path(unmapped_fastq_path).unlink(missing_ok=True)
 
     with ProcessPoolExecutor(
         max_workers=worker_count,
@@ -478,6 +522,17 @@ def run_transcript_mapping_to_parquet_mt(
                     decoy_reference_patterns=(
                         parsed_decoy_reference_patterns
                     ),
+                    unmapped_fastq_part=(
+                        str(
+                            unmapped_parts_directory
+                            / (
+                                f"part_{fastq_batch_index:06d}_"
+                                f"{chunk_index:03d}.fastq.gz"
+                            )
+                        )
+                        if unmapped_parts_directory is not None
+                        else None
+                    ),
                 )
                 for chunk_index, chunk
                 in enumerate(
@@ -488,6 +543,7 @@ def run_transcript_mapping_to_parquet_mt(
             batch_mapped_read_count = 0
             batch_decoy_filtered_read_count = 0
             batch_output_files: list[str] = []
+            batch_unmapped_parts: list[str] = []
 
             for worker_result in executor.map(
                 map_and_write_chunk,
@@ -509,9 +565,20 @@ def run_transcript_mapping_to_parquet_mt(
                     worker_result.decoy_filtered_read_count
                 )
 
-                batch_output_files.extend(
-                    worker_result.output_files
-                )
+                batch_output_files.extend(worker_result.output_files)
+
+                if worker_result.unmapped_fastq_part is not None:
+                    batch_unmapped_parts.append(
+                        worker_result.unmapped_fastq_part
+                    )
+
+            if unmapped_fastq_path is not None:
+                with Path(unmapped_fastq_path).open("ab") as output_handle:
+                    for part_path_text in batch_unmapped_parts:
+                        part_path = Path(part_path_text)
+                        with part_path.open("rb") as input_handle:
+                            shutil.copyfileobj(input_handle, output_handle)
+                        part_path.unlink(missing_ok=True)
 
             logger.info(
                 "FASTQBatch=%d "
@@ -625,5 +692,44 @@ def run_transcript_mapping_to_parquet_mt(
         "Average speed: %.1f reads/s",
         speed,
     )
+
+    if stats_json_path is not None:
+        analyzable_reads = (
+            counters.total_reads
+            - decoy_filtered_read_count
+        )
+        stats = {
+            "input_reads": counters.total_reads,
+            "transcript_mapped": counters.mapped_reads,
+            "group_unique": counters.group_unique_reads,
+            "group_multi": counters.group_multi_reads,
+            "transcript_unmapped": counters.unmapped_reads,
+            "decoy_filtered": decoy_filtered_read_count,
+            "best_hit_limit_reached": counters.best_hit_overflow_reads,
+            "analyzable_reads": analyzable_reads,
+            "transcript_mapped_rate_percent": percentage(
+                counters.mapped_reads, counters.total_reads
+            ),
+            "transcript_unique_rate_percent": percentage(
+                counters.group_unique_reads, counters.total_reads
+            ),
+            "transcript_multi_rate_percent": percentage(
+                counters.group_multi_reads, counters.total_reads
+            ),
+            "transcript_unmapped_rate_percent": percentage(
+                counters.unmapped_reads, counters.total_reads
+            ),
+            "decoy_filtered_rate_percent": percentage(
+                decoy_filtered_read_count, counters.total_reads
+            ),
+            "transcript_mapped_non_decoy_rate_percent": percentage(
+                counters.mapped_reads, analyzable_reads
+            ),
+        }
+        write_mapping_stats(stats_json_path, stats)
+        logger.info(
+            "Mapping statistics JSON: %s",
+            stats_json_path,
+        )
 
     return counters

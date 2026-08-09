@@ -76,6 +76,8 @@ def read_groups(
         "group_index",
         "group_count",
         "other_group_ids",
+        "reference_start",
+        "reference_end",
     ]
 
     current_group_id: str | None = None
@@ -203,9 +205,114 @@ def union_interval_length(
     return total_length
 
 
+
+def determine_group_length(
+    rows: list[dict],
+    reference_definitions: dict,
+    hit_transcript_ids: set[str],
+    minimum_mapped_reads: int,
+    minimum_mapped_span: int,
+    minimum_transcript_fraction: float,
+) -> int:
+    """
+    Determine the group length from CDS annotation or mapped-read span.
+
+    Priority:
+
+        1. Non-redundant annotated CDS length.
+        2. Mapped span when annotation is absent and support is sufficient.
+        3. Maximum transcript length among hit references.
+    """
+
+    cds_intervals: set[
+        tuple[str, str, int, int]
+    ] = set()
+
+    maximum_transcript_length = 0
+
+    for transcript_id in hit_transcript_ids:
+        definition = reference_definitions.get(
+            transcript_id
+        )
+
+        if definition is None:
+            continue
+
+        cds_intervals.update(
+            definition.cds_intervals
+        )
+
+        maximum_transcript_length = max(
+            maximum_transcript_length,
+            int(
+                definition.transcript_length
+            ),
+        )
+
+    annotated_cds_length = (
+        union_interval_length(
+            cds_intervals
+        )
+    )
+
+    if annotated_cds_length > 0:
+        return annotated_cds_length
+
+    distinct_read_count = len(
+        {
+            row["read_id"]
+            for row in rows
+        }
+    )
+
+    if rows:
+        mapped_start = min(
+            int(
+                row["reference_start"]
+            )
+            for row in rows
+        )
+
+        mapped_end = max(
+            int(
+                row["reference_end"]
+            )
+            for row in rows
+        )
+
+        mapped_span = max(
+            mapped_end - mapped_start,
+            1,
+        )
+    else:
+        mapped_span = 0
+
+    comparison_length = max(
+        maximum_transcript_length,
+        1,
+    )
+
+    use_mapped_span = (
+        distinct_read_count
+        > minimum_mapped_reads
+        and mapped_span
+        >= minimum_mapped_span
+        and mapped_span
+        >= comparison_length
+        * minimum_transcript_fraction
+    )
+
+    if use_mapped_span:
+        return mapped_span
+
+    return comparison_length
+
 def extract_group(
     group_id: str,
     rows: list[dict],
+    minimum_mapped_reads: int,
+    minimum_mapped_span: int,
+    minimum_transcript_fraction: float,
 ) -> tuple[
     dict,
     list[dict],
@@ -288,34 +395,28 @@ def extract_group(
         )
     )
 
-    cds_intervals: set[
-        tuple[
-            str,
-            str,
-            int,
-            int,
-        ]
-    ] = set()
-
-    for transcript_id in hit_transcript_ids:
-        definition = (
-            reference_definitions.get(
-                transcript_id
-            )
-        )
-
-        if definition is None:
-            continue
-
-        cds_intervals.update(
-            definition.cds_intervals
-        )
+    group_length = determine_group_length(
+        rows=rows,
+        reference_definitions=(
+            reference_definitions
+        ),
+        hit_transcript_ids=(
+            hit_transcript_ids
+        ),
+        minimum_mapped_reads=(
+            minimum_mapped_reads
+        ),
+        minimum_mapped_span=(
+            minimum_mapped_span
+        ),
+        minimum_transcript_fraction=(
+            minimum_transcript_fraction
+        ),
+    )
 
     group_record = {
         "group_id": group_id,
-        "cds_length": union_interval_length(
-            cds_intervals
-        ),
+        "cds_length": group_length,
         "group_unique_read_count": len(
             unique_read_ids
         ),
@@ -354,6 +455,9 @@ def process_file_worker(
     batch_size: int,
     write_batch_size: int,
     overwrite: bool,
+    minimum_mapped_reads: int,
+    minimum_mapped_span: int,
+    minimum_transcript_fraction: float,
 ) -> tuple[
     str,
     str,
@@ -418,6 +522,15 @@ def process_file_worker(
             ) = extract_group(
                 group_id=group_id,
                 rows=rows,
+                minimum_mapped_reads=(
+                    minimum_mapped_reads
+                ),
+                minimum_mapped_span=(
+                    minimum_mapped_span
+                ),
+                minimum_transcript_fraction=(
+                    minimum_transcript_fraction
+                ),
             )
 
             group_buffer.append(
@@ -489,6 +602,9 @@ def _run_one_file_process(
     batch_size: int,
     write_batch_size: int,
     overwrite: bool,
+    minimum_mapped_reads: int,
+    minimum_mapped_span: int,
+    minimum_transcript_fraction: float,
     status_directory: str,
 ) -> None:
     """
@@ -517,6 +633,15 @@ def _run_one_file_process(
             batch_size=batch_size,
             write_batch_size=write_batch_size,
             overwrite=overwrite,
+            minimum_mapped_reads=(
+                minimum_mapped_reads
+            ),
+            minimum_mapped_span=(
+                minimum_mapped_span
+            ),
+            minimum_transcript_fraction=(
+                minimum_transcript_fraction
+            ),
         )
 
         status_path.write_text(
@@ -545,6 +670,11 @@ def extract_em_input(
     write_batch_size: int = 100000,
     worker_count: int = 4,
     overwrite: bool = False,
+    minimum_mapped_reads: int = 10,
+    minimum_mapped_span: int = 100,
+    minimum_transcript_fraction: float = (
+        1.0 / 3.0
+    ),
 ) -> None:
     """
     Create final EM-input shards with bounded multiprocessing.
@@ -640,6 +770,9 @@ def extract_em_input(
                         batch_size,
                         write_batch_size,
                         overwrite,
+                        minimum_mapped_reads,
+                        minimum_mapped_span,
+                        minimum_transcript_fraction,
                         str(status_directory),
                     ),
                 )

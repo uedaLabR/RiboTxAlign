@@ -72,6 +72,12 @@ class MappyMapper:
             cs=False,
             MD=False,
         ):
+
+            # Transcript references are stored in the 5' to 3' direction.
+            # Retain only forward-strand alignments.
+            if hit.strand != 1:
+                continue
+
             alignment = RawAlignment(
                 read_id=read_id,
                 reference_name=hit.ctg,

@@ -21,11 +21,15 @@ OUTPUT_PREFIX = (
     "HEK293T_RiboTxAlign"
 )
 
+DECOY_DIRECTORY = (
+    "/mnt/share/project/riboML/decoy_fasta"
+)
 
 reference_transcripts = build_transcript_reference(
     gencode_gff3=GENCODE_GFF3,
     stringtie_gtf=STRINGTIE_GTF,
     genome_fasta=GENOME_FASTA,
+    decoy_directory=DECOY_DIRECTORY,
     output_prefix=OUTPUT_PREFIX,
 )
 

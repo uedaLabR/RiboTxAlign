@@ -87,9 +87,21 @@ def process_single_transcript_group(
             {
                 "group_id": group_id,
                 "transcript_id": transcript_id,
+                "alignment_transcript_id": record.get(
+                    "alignment_transcript_id",
+                    record["transcript_id"],
+                ),
                 "read_id": record["read_id"],
                 "start": record["reference_start"],
                 "end": record["reference_end"],
+                "read_length": int(
+                    record["read_length"]
+                ),
+                "hit_index": int(record["hit_index"]),
+                "query_start": int(record["query_start"]),
+                "query_end": int(record["query_end"]),
+                "mapping_strand": int(record["strand"]),
+                "cigar": str(record["cigar"]),
                 "prior_probability": prior_probability,
                 "transcript_probability": 1.0,
             }
@@ -101,8 +113,44 @@ def write_reads_info(
 ):
     """Write read assignment information to Parquet."""
 
+    schema = pa.schema(
+        [
+            ("group_id", pa.string()),
+            ("transcript_id", pa.string()),
+            ("alignment_transcript_id", pa.string()),
+            ("read_id", pa.string()),
+            ("start", pa.int64()),
+            ("end", pa.int64()),
+            ("read_length", pa.int32()),
+            ("hit_index", pa.int32()),
+            ("query_start", pa.int32()),
+            ("query_end", pa.int32()),
+            ("mapping_strand", pa.int8()),
+            ("cigar", pa.string()),
+            ("prior_probability", pa.float64()),
+            ("transcript_probability", pa.float64()),
+            (
+                "other_transcript_ids",
+                pa.list_(pa.string()),
+            ),
+        ]
+    )
+
+    normalized_rows = []
+
+    for row in reads_info:
+        normalized_row = dict(row)
+        normalized_row.setdefault(
+            "other_transcript_ids",
+            [],
+        )
+        normalized_rows.append(
+            normalized_row
+        )
+
     table = pa.Table.from_pylist(
-        reads_info
+        normalized_rows,
+        schema=schema,
     )
 
     pq.write_table(
@@ -194,4 +242,3 @@ def append_transcript_merge_log(
             )
 
         handle.flush()
-

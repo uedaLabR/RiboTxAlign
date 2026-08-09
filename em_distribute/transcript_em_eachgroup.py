@@ -44,8 +44,12 @@ def prepare_read_hits(
             }
 
         transcript_id = record["transcript_id"]
+        alignment_transcript_id = record.get(
+            "alignment_transcript_id",
+            transcript_id,
+        )
 
-        # Keep only one record for each read-transcript pair.
+        # Keep only one record for each read-EM-transcript pair.
         if transcript_id in read_data[read_id]["candidate_hits"]:
             continue
 
@@ -53,8 +57,17 @@ def prepare_read_hits(
             transcript_id
         ] = {
             "transcript_id": transcript_id,
+            "alignment_transcript_id": alignment_transcript_id,
             "start": record["reference_start"],
             "end": record["reference_end"],
+            "read_length": int(
+                record["read_length"]
+            ),
+            "hit_index": int(record["hit_index"]),
+            "query_start": int(record["query_start"]),
+            "query_end": int(record["query_end"]),
+            "mapping_strand": int(record["strand"]),
+            "cigar": str(record["cigar"]),
         }
 
     read_hits = []
@@ -103,51 +116,51 @@ def calculate_weighted_unique_counts(
     return unique_counts
 
 
-def initialize_transcript_counts(
+def initialize_transcript_tpm(
     transcript_ids,
     unique_counts,
+    transcript_unique_lengths,
+    group_tpm_value,
     zero_start_fraction=1.0 / 3.0,
 ):
-    """
-    Initialize expected counts mainly from transcript-unique reads.
+    """Initialize transcript TPM from unique-read density."""
 
-    Transcripts without unique reads start from one third of the
-    smallest positive unique count.
-    """
-
-    positive_unique_counts = [
-        count
-        for count in unique_counts.values()
-        if count > 0.0
-    ]
-
-    if positive_unique_counts:
-        zero_start_count = (
-            min(positive_unique_counts)
-            * zero_start_fraction
-        )
-    else:
-        zero_start_count = 1.0
-
-    initial_counts = {}
+    initial_rates = {}
 
     for transcript_id in transcript_ids:
-        unique_count = unique_counts.get(
-            transcript_id,
-            0.0,
-        )
+        unique_count = unique_counts.get(transcript_id, 0.0)
+        unique_length = transcript_unique_lengths.get(transcript_id, 0)
 
-        if unique_count > 0.0:
-            initial_counts[
-                transcript_id
-            ] = unique_count
+        if unique_count > 0.0 and unique_length > 0:
+            initial_rates[transcript_id] = unique_count / unique_length
         else:
-            initial_counts[
-                transcript_id
-            ] = zero_start_count
+            initial_rates[transcript_id] = 0.0
 
-    return initial_counts
+    positive_rates = [
+        rate
+        for rate in initial_rates.values()
+        if rate > 0.0
+    ]
+    zero_start_rate = (
+        min(positive_rates) * zero_start_fraction
+        if positive_rates
+        else 1.0
+    )
 
+    for transcript_id in transcript_ids:
+        if initial_rates[transcript_id] <= 0.0:
+            initial_rates[transcript_id] = zero_start_rate
+
+    total_rate = sum(initial_rates.values())
+
+    return {
+        transcript_id: (
+            group_tpm_value
+            * initial_rates[transcript_id]
+            / total_rate
+        )
+        for transcript_id in transcript_ids
+    }
 
 def calculate_transcript_tpm(
     transcript_ids,
@@ -358,8 +371,19 @@ def append_final_read_information(
                         "read_id"
                     ],
                     "transcript_id": transcript_id,
+                    "alignment_transcript_id": hit[
+                        "alignment_transcript_id"
+                    ],
                     "start": hit["start"],
                     "end": hit["end"],
+                    "read_length": hit[
+                        "read_length"
+                    ],
+                    "hit_index": hit["hit_index"],
+                    "query_start": hit["query_start"],
+                    "query_end": hit["query_end"],
+                    "mapping_strand": hit["mapping_strand"],
+                    "cigar": hit["cigar"],
                     "prior_probability": read_info[
                         "prior_probability"
                     ],
@@ -378,6 +402,7 @@ def execute_transcript_em_eachgroup(
     transcript_ids,
     group_records,
     group_tpm,
+    transcript_unique_lengths,
     transcript_cds_lengths,
     reads_info,
     transcript_tpm,
@@ -407,20 +432,15 @@ def execute_transcript_em_eachgroup(
         read_hits=read_hits,
     )
 
-    initial_counts = initialize_transcript_counts(
+    current_tpm = initialize_transcript_tpm(
         transcript_ids=transcript_ids,
         unique_counts=unique_counts,
+        transcript_unique_lengths=transcript_unique_lengths,
+        group_tpm_value=group_tpm_value,
         zero_start_fraction=zero_start_fraction,
     )
 
-    current_tpm = calculate_transcript_tpm(
-        transcript_ids=transcript_ids,
-        expected_counts=initial_counts,
-        transcript_cds_lengths=transcript_cds_lengths,
-        group_tpm_value=group_tpm_value,
-    )
-
-    final_expected_counts = initial_counts
+    final_expected_counts = unique_counts
 
     for iteration in range(
         1,

@@ -166,39 +166,76 @@ def merge_transcripts(
     )
 
 
+def _alignment_record_priority(
+    record,
+    merged_transcript_id,
+):
+    """Return a deterministic priority for one merged alignment record.
+
+    A hit aligned directly to the representative transcript is preferred.
+    Remaining ties are resolved by hit index and original transcript ID.
+    """
+
+    original_transcript_id = record["transcript_id"]
+
+    return (
+        0 if original_transcript_id == merged_transcript_id else 1,
+        int(record.get("hit_index", 0)),
+        original_transcript_id,
+        int(record.get("reference_start", 0)),
+        int(record.get("reference_end", 0)),
+    )
+
+
 def apply_transcript_merges(
     group_records,
     merge_map,
 ):
-    """Apply transcript merges and remove duplicate read-transcript hits."""
+    """Apply EM transcript merges while preserving alignment coordinates.
 
-    merged_records = []
-    seen_hits = set()
+    ``transcript_id`` is the representative ID used by transcript EM.
+    ``alignment_transcript_id`` remains the reference against which the
+    original mapping coordinates and CIGAR were produced.
+    """
+
+    selected_records = {}
 
     for record in group_records:
-        transcript_id = merge_map.get(
-            record["transcript_id"],
-            record["transcript_id"],
+        original_transcript_id = record["transcript_id"]
+        merged_transcript_id = merge_map.get(
+            original_transcript_id,
+            original_transcript_id,
         )
 
         hit_key = (
             record["read_id"],
-            transcript_id,
+            merged_transcript_id,
         )
 
-        if hit_key in seen_hits:
-            continue
+        current_record = selected_records.get(hit_key)
 
-        seen_hits.add(hit_key)
+        if current_record is not None:
+            current_priority = _alignment_record_priority(
+                current_record,
+                merged_transcript_id,
+            )
+            new_priority = _alignment_record_priority(
+                record,
+                merged_transcript_id,
+            )
+
+            if new_priority >= current_priority:
+                continue
 
         updated_record = record.copy()
-        updated_record["transcript_id"] = transcript_id
-
-        merged_records.append(
-            updated_record
+        updated_record["alignment_transcript_id"] = (
+            original_transcript_id
         )
+        updated_record["transcript_id"] = merged_transcript_id
 
-    return merged_records
+        selected_records[hit_key] = updated_record
+
+    return list(selected_records.values())
 
 from em_distribute.transcript_em_utils import *
 from em_distribute.reference_utils import *
@@ -266,11 +303,19 @@ def process_multi_transcript_group(
             )
             return
 
+    transcript_unique_lengths = determine_unique_transcript_lengths(
+        transcript_ids=transcript_ids,
+        reference_definitions=reference_definitions,
+        unique_junction_length=50,
+    )
+
     transcript_cds_lengths = determine_transcript_lengths(
         transcript_ids=transcript_ids,
         group_records=group_records,
         reference_definitions=reference_definitions,
         minimum_mapped_reads=10,
+        minimum_mapped_span=100,
+        minimum_transcript_fraction=1.0 / 3.0,
     )
 
     # Transcript-level EM will start from here.
@@ -279,6 +324,7 @@ def process_multi_transcript_group(
         transcript_ids=transcript_ids,
         group_records=group_records,
         group_tpm=group_tpm,
+        transcript_unique_lengths=transcript_unique_lengths,
         transcript_cds_lengths=transcript_cds_lengths,
         reads_info=reads_info,
         transcript_tpm=transcript_tpm,

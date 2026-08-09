@@ -759,8 +759,8 @@ def run_group_em(
     mapping_log_path: str | Path,
     output_tsv_path: str | Path,
     output_log_path: str | Path,
-    trial_count: int = 100,
-    convergence_threshold: float = 1e-6,
+    trial_count: int = 300,
+    convergence_threshold: float = 10,
     read_length: int = 30,
     batch_size: int = 100000,
 ) -> EmRunResult:

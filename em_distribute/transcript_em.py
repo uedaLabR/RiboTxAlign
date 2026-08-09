@@ -78,13 +78,15 @@ def em_transcript(
     transcript_tpm_tsv: str | Path,
     transcript_merge_log_tsv: str | Path,
     reference_metadata_tsv: str | Path,
+    reference_gtf: str | Path,
 
 ):
     group_tpm = load_group_tpm(
         group_em_tsv
     )
-    reference_definitions = load_reference_metadata(
-        reference_metadata_tsv
+    reference_definitions = load_reference_definitions(
+        metadata_tsv=reference_metadata_tsv,
+        reference_gtf=reference_gtf,
     )
 
     reads_info = []
