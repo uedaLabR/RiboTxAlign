@@ -44,12 +44,8 @@ def prepare_read_hits(
             }
 
         transcript_id = record["transcript_id"]
-        alignment_transcript_id = record.get(
-            "alignment_transcript_id",
-            transcript_id,
-        )
 
-        # Keep only one record for each read-EM-transcript pair.
+        # Keep only one record for each read-transcript pair.
         if transcript_id in read_data[read_id]["candidate_hits"]:
             continue
 
@@ -57,7 +53,10 @@ def prepare_read_hits(
             transcript_id
         ] = {
             "transcript_id": transcript_id,
-            "alignment_transcript_id": alignment_transcript_id,
+            "alignment_transcript_id": record.get(
+                "alignment_transcript_id",
+                transcript_id,
+            ),
             "start": record["reference_start"],
             "end": record["reference_end"],
             "read_length": int(
@@ -116,51 +115,500 @@ def calculate_weighted_unique_counts(
     return unique_counts
 
 
-def initialize_transcript_tpm(
-    transcript_ids,
-    unique_counts,
-    transcript_unique_lengths,
-    group_tpm_value,
-    zero_start_fraction=1.0 / 3.0,
+def get_reference_rna_tpm(
+    transcript_id,
+    reference_definitions,
 ):
-    """Initialize transcript TPM from unique-read density."""
+    """Return non-negative RNA-seq TPM stored in reference metadata."""
 
-    initial_rates = {}
+    try:
+        rna_tpm = float(
+            reference_definitions[
+                transcript_id
+            ].get(
+                "rna_tpm",
+                0.0,
+            )
+        )
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
+        return 0.0
 
-    for transcript_id in transcript_ids:
-        unique_count = unique_counts.get(transcript_id, 0.0)
-        unique_length = transcript_unique_lengths.get(transcript_id, 0)
-
-        if unique_count > 0.0 and unique_length > 0:
-            initial_rates[transcript_id] = unique_count / unique_length
-        else:
-            initial_rates[transcript_id] = 0.0
-
-    positive_rates = [
-        rate
-        for rate in initial_rates.values()
-        if rate > 0.0
-    ]
-    zero_start_rate = (
-        min(positive_rates) * zero_start_fraction
-        if positive_rates
-        else 1.0
+    return max(
+        rna_tpm,
+        0.0,
     )
 
-    for transcript_id in transcript_ids:
-        if initial_rates[transcript_id] <= 0.0:
-            initial_rates[transcript_id] = zero_start_rate
 
-    total_rate = sum(initial_rates.values())
+def calculate_rna_tpm_weights(
+    transcript_ids,
+    reference_definitions,
+    minimum_weight=1.0e-6,
+):
+    """Normalize RNA-seq TPM within one transcript group.
+
+    A very small floor prevents a transcript with zero RNA TPM from becoming
+    an absorbing zero state during transcript EM.
+    """
+
+    transcript_ids = sorted(
+        transcript_ids
+    )
+
+    rna_tpm = {
+        transcript_id: get_reference_rna_tpm(
+            transcript_id,
+            reference_definitions,
+        )
+        for transcript_id in transcript_ids
+    }
+
+    total_tpm = sum(
+        rna_tpm.values()
+    )
+
+    if total_tpm <= 0.0:
+        equal_weight = (
+            1.0
+            / len(transcript_ids)
+        )
+
+        return {
+            transcript_id: equal_weight
+            for transcript_id in transcript_ids
+        }
+
+    weights = {
+        transcript_id: (
+            rna_tpm[transcript_id]
+            / total_tpm
+        )
+        for transcript_id in transcript_ids
+    }
+
+    if minimum_weight > 0.0:
+        weights = {
+            transcript_id: max(
+                weight,
+                minimum_weight,
+            )
+            for transcript_id, weight in (
+                weights.items()
+            )
+        }
+
+        total_weight = sum(
+            weights.values()
+        )
+
+        weights = {
+            transcript_id: (
+                weight
+                / total_weight
+            )
+            for transcript_id, weight in (
+                weights.items()
+            )
+        }
+
+    return weights
+
+
+def calculate_unique_fractions(
+    transcript_ids,
+    transcript_unique_lengths,
+    transcript_cds_lengths,
+):
+    """Calculate the distinguishable fraction of each effective transcript."""
+
+    unique_fractions = {}
+
+    for transcript_id in transcript_ids:
+        unique_length = max(
+            float(
+                transcript_unique_lengths.get(
+                    transcript_id,
+                    0,
+                )
+                or 0
+            ),
+            0.0,
+        )
+
+        transcript_length = max(
+            float(
+                transcript_cds_lengths.get(
+                    transcript_id,
+                    0,
+                )
+                or 0
+            ),
+            1.0,
+        )
+
+        unique_fractions[
+            transcript_id
+        ] = min(
+            unique_length
+            / transcript_length,
+            1.0,
+        )
+
+    return unique_fractions
+
+
+def calculate_effective_group_read_count(
+    read_hits,
+):
+    """Return group-level expected read count from group prior probabilities."""
+
+    effective_count = sum(
+        max(
+            float(
+                read_info.get(
+                    "prior_probability",
+                    0.0,
+                )
+                or 0.0
+            ),
+            0.0,
+        )
+        for read_info in read_hits
+    )
+
+    if effective_count > 0.0:
+        return effective_count
+
+    return float(
+        len(read_hits)
+    )
+
+
+def calculate_rna_count_weights(
+    transcript_ids,
+    rna_tpm_weights,
+    transcript_cds_lengths,
+):
+    """Convert RNA TPM weights to expected Ribo read-count fractions.
+
+    RNA TPM is a length-normalized abundance. Under the initialization model,
+    expected total footprint count is proportional to RNA TPM times the
+    effective translated length.
+    """
+
+    raw_weights = {}
+
+    for transcript_id in transcript_ids:
+        transcript_length = max(
+            float(
+                transcript_cds_lengths.get(
+                    transcript_id,
+                    0,
+                )
+                or 0
+            ),
+            1.0,
+        )
+
+        raw_weights[
+            transcript_id
+        ] = (
+            rna_tpm_weights[
+                transcript_id
+            ]
+            * transcript_length
+        )
+
+    total_weight = sum(
+        raw_weights.values()
+    )
+
+    if total_weight <= 0.0:
+        equal_weight = (
+            1.0
+            / len(transcript_ids)
+        )
+
+        return {
+            transcript_id: equal_weight
+            for transcript_id in transcript_ids
+        }
+
+    return {
+        transcript_id: (
+            raw_weights[transcript_id]
+            / total_weight
+        )
+        for transcript_id in transcript_ids
+    }
+
+
+def calculate_poisson_initial_abundance(
+    transcript_ids,
+    unique_counts,
+    unique_fractions,
+    rna_count_weights,
+    effective_group_read_count,
+    rna_prior_strength=5.0,
+):
+    """Estimate initial transcript read counts with a Gamma-Poisson model.
+
+    Let n_i be the total expected footprint count from transcript i and f_i
+    its distinguishable fraction. The observed unique count is modeled as
+
+        U_i ~ Poisson(f_i * n_i)
+
+    RNA-seq supplies a Gamma prior for n_i. ``rna_prior_strength`` is the
+    total prior pseudo-count across the transcript group.
+
+    The returned value is the posterior mean of n_i.
+    """
+
+    transcript_ids = sorted(
+        transcript_ids
+    )
+
+    if rna_prior_strength <= 0.0:
+        raise ValueError(
+            "rna_prior_strength must be positive."
+        )
+
+    group_count = max(
+        float(
+            effective_group_read_count
+        ),
+        1.0e-12,
+    )
+
+    prior_rate = (
+        rna_prior_strength
+        / group_count
+    )
+
+    initial_abundance = {}
+
+    for transcript_id in transcript_ids:
+        unique_fraction = max(
+            float(
+                unique_fractions.get(
+                    transcript_id,
+                    0.0,
+                )
+                or 0.0
+            ),
+            0.0,
+        )
+
+        unique_count = max(
+            float(
+                unique_counts.get(
+                    transcript_id,
+                    0.0,
+                )
+                or 0.0
+            ),
+            0.0,
+        )
+
+        # A positive unique count with zero modeled unique fraction is
+        # internally inconsistent. Ignore that count for initialization
+        # rather than creating an infinite density.
+        if unique_fraction <= 0.0:
+            unique_count = 0.0
+
+        prior_shape = (
+            rna_prior_strength
+            * rna_count_weights[
+                transcript_id
+            ]
+        )
+
+        posterior_shape = (
+            unique_count
+            + prior_shape
+        )
+
+        posterior_rate = (
+            unique_fraction
+            + prior_rate
+        )
+
+        initial_abundance[
+            transcript_id
+        ] = (
+            posterior_shape
+            / posterior_rate
+        )
+
+    return initial_abundance
+
+
+def convert_abundance_to_density_rates(
+    transcript_ids,
+    transcript_abundance,
+    transcript_cds_lengths,
+):
+    """Convert expected transcript read counts to length-normalized rates."""
+
+    return {
+        transcript_id: (
+            transcript_abundance[
+                transcript_id
+            ]
+            / max(
+                float(
+                    transcript_cds_lengths.get(
+                        transcript_id,
+                        0,
+                    )
+                    or 0
+                ),
+                1.0,
+            )
+        )
+        for transcript_id in transcript_ids
+    }
+
+
+def scale_initial_rates_to_group_tpm(
+    transcript_ids,
+    initial_rates,
+    group_tpm_value,
+):
+    """Scale positive initial transcript rates so their TPM sum equals group TPM."""
+
+    total_rate = sum(
+        max(
+            float(
+                initial_rates.get(
+                    transcript_id,
+                    0.0,
+                )
+                or 0.0
+            ),
+            0.0,
+        )
+        for transcript_id in transcript_ids
+    )
+
+    if total_rate <= 0.0:
+        equal_tpm = (
+            group_tpm_value
+            / len(transcript_ids)
+        )
+
+        return {
+            transcript_id: equal_tpm
+            for transcript_id in transcript_ids
+        }
 
     return {
         transcript_id: (
             group_tpm_value
-            * initial_rates[transcript_id]
+            * max(
+                float(
+                    initial_rates.get(
+                        transcript_id,
+                        0.0,
+                    )
+                    or 0.0
+                ),
+                0.0,
+            )
             / total_rate
         )
         for transcript_id in transcript_ids
     }
+
+
+def initialize_transcript_tpm(
+    transcript_ids,
+    unique_counts,
+    transcript_unique_lengths,
+    transcript_cds_lengths,
+    reference_definitions,
+    read_hits,
+    group_tpm_value,
+    rna_prior_strength=5.0,
+):
+    """Initialize transcript TPM from unique Ribo evidence and RNA-seq TPM.
+
+    The function deliberately delegates each conceptual step to a small helper
+    so the initialization model can later be changed without modifying EM.
+    """
+
+    transcript_ids = sorted(
+        transcript_ids
+    )
+
+    rna_tpm_weights = calculate_rna_tpm_weights(
+        transcript_ids=transcript_ids,
+        reference_definitions=reference_definitions,
+    )
+
+    unique_fractions = calculate_unique_fractions(
+        transcript_ids=transcript_ids,
+        transcript_unique_lengths=(
+            transcript_unique_lengths
+        ),
+        transcript_cds_lengths=(
+            transcript_cds_lengths
+        ),
+    )
+
+    effective_group_read_count = (
+        calculate_effective_group_read_count(
+            read_hits=read_hits,
+        )
+    )
+
+    rna_count_weights = (
+        calculate_rna_count_weights(
+            transcript_ids=transcript_ids,
+            rna_tpm_weights=rna_tpm_weights,
+            transcript_cds_lengths=(
+                transcript_cds_lengths
+            ),
+        )
+    )
+
+    transcript_abundance = (
+        calculate_poisson_initial_abundance(
+            transcript_ids=transcript_ids,
+            unique_counts=unique_counts,
+            unique_fractions=unique_fractions,
+            rna_count_weights=(
+                rna_count_weights
+            ),
+            effective_group_read_count=(
+                effective_group_read_count
+            ),
+            rna_prior_strength=(
+                rna_prior_strength
+            ),
+        )
+    )
+
+    initial_rates = (
+        convert_abundance_to_density_rates(
+            transcript_ids=transcript_ids,
+            transcript_abundance=(
+                transcript_abundance
+            ),
+            transcript_cds_lengths=(
+                transcript_cds_lengths
+            ),
+        )
+    )
+
+    return scale_initial_rates_to_group_tpm(
+        transcript_ids=transcript_ids,
+        initial_rates=initial_rates,
+        group_tpm_value=group_tpm_value,
+    )
 
 def calculate_transcript_tpm(
     transcript_ids,
@@ -406,9 +854,10 @@ def execute_transcript_em_eachgroup(
     transcript_cds_lengths,
     reads_info,
     transcript_tpm,
-    max_iterations=200,
+    reference_definitions,
+    max_iterations=1000,
     convergence_threshold=1.0e-6,
-    zero_start_fraction=1.0 / 3.0,
+    rna_prior_strength=5.0,
 ):
     """Execute transcript-level EM for one transcript group."""
 
@@ -435,9 +884,20 @@ def execute_transcript_em_eachgroup(
     current_tpm = initialize_transcript_tpm(
         transcript_ids=transcript_ids,
         unique_counts=unique_counts,
-        transcript_unique_lengths=transcript_unique_lengths,
+        transcript_unique_lengths=(
+            transcript_unique_lengths
+        ),
+        transcript_cds_lengths=(
+            transcript_cds_lengths
+        ),
+        reference_definitions=(
+            reference_definitions
+        ),
+        read_hits=read_hits,
         group_tpm_value=group_tpm_value,
-        zero_start_fraction=zero_start_fraction,
+        rna_prior_strength=(
+            rna_prior_strength
+        ),
     )
 
     final_expected_counts = unique_counts

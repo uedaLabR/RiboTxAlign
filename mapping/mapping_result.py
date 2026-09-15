@@ -18,6 +18,8 @@ class RawAlignment:
     alignment_length: int
     edit_distance: int
     cigartuples: list[tuple[int, int]]
+    is_cds: bool = False
+    cds_source: str = "unresolved"
 
     @property
     def score(self) -> int:

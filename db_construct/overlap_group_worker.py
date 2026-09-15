@@ -55,9 +55,15 @@ def find_groups_in_one_reference_strand(
     """
     Find transitive exon-overlap groups in one chromosome-strand set.
 
-    StringTie transcripts are first collapsed within each StringTie gene.
-    GENCODE transcripts are retained only for later annotation and
-    structural comparison.
+    StringTie models are collapsed conservatively before overlap grouping:
+      - exact exon structure;
+      - the same inferred CDS structure, using the outermost GENCODE CDS
+        window for a uniquely assigned gene;
+      - or, when CDS is not uniquely inferable, differences restricted to
+        the biological first/last exon outer boundaries.
+
+    The longest compatible StringTie structure is retained and the TPM of
+    collapsed StringTie members is summed.
     """
 
     gencode_transcripts = [
@@ -74,7 +80,12 @@ def find_groups_in_one_reference_strand(
 
     collapsed_stringtie = (
         collapse_stringtie_subsets(
-            stringtie_transcripts
+            stringtie_transcripts=(
+                stringtie_transcripts
+            ),
+            gencode_transcripts=(
+                gencode_transcripts
+            ),
         )
     )
 
@@ -100,8 +111,6 @@ def find_groups_in_one_reference_strand(
         Transcript
     ] = []
 
-    current_group_end: int | None = None
-
     for transcript in working_transcripts:
         if transcript.start is None:
             continue
@@ -110,9 +119,6 @@ def find_groups_in_one_reference_strand(
             current_group = [
                 transcript
             ]
-            current_group_end = (
-                transcript.end
-            )
             continue
 
         has_overlap = any(
@@ -127,17 +133,6 @@ def find_groups_in_one_reference_strand(
             current_group.append(
                 transcript
             )
-
-            if transcript.end is not None:
-                if current_group_end is None:
-                    current_group_end = (
-                        transcript.end
-                    )
-                else:
-                    current_group_end = max(
-                        current_group_end,
-                        transcript.end,
-                    )
             continue
 
         overlap_groups.append(
@@ -147,9 +142,6 @@ def find_groups_in_one_reference_strand(
         current_group = [
             transcript
         ]
-        current_group_end = (
-            transcript.end
-        )
 
     if current_group:
         overlap_groups.append(
@@ -157,7 +149,7 @@ def find_groups_in_one_reference_strand(
         )
 
     print(
-        "StringTie subset collapse:",
+        "StringTie conservative collapse:",
         chrom,
         strand,
         "before=",

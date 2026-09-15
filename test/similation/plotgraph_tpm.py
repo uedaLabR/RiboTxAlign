@@ -1,0 +1,1795 @@
+#!/usr/bin/env python3
+
+import re
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from scipy.stats import pearsonr, spearmanr
+from matplotlib_venn import venn2
+
+
+# ============================================================
+# Paths
+# ============================================================
+
+BASE = Path(
+    "/mnt/share/project/riboML/"
+    "validation_expression/similation/HEK293T"
+)
+
+PLOTS = BASE / "plots_transcript"
+PLOTS.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+TRUTH_PROFILE = (
+    BASE
+    / "HEK293T.simulation.profile"
+)
+
+RIBOTX_MATCHING_FILES = {
+    "RiboTxAlign_LongRead":
+        BASE
+        / "RiboTxAlign_LongRead.source_rescue_matching.tsv",
+
+    "RiboTxAlign_RNASeq":
+        BASE
+        / "RiboTxAlign_RNASeq.source_rescue_matching.tsv",
+}
+
+RIBOMAP = Path(
+    "/mnt/share/project/riboML/"
+    "validation_expression/"
+    "riboMap/HEK293T/"
+    "ribomap.stats"
+)
+
+GENCODE_GFF3 = Path(
+    "/mnt/share/project/riboML/validation/reference/"
+    "gencode.v44.annotation.gff3"
+)
+
+
+DEEPSHAPE = Path(
+    "/mnt/share/project/riboML/"
+    "validation_expression/"
+    "deepShape/HEK293T/"
+    "DeepShapePrimeOutputs/"
+    "runlog_199.txt"
+)
+
+
+# ============================================================
+# Utility
+# ============================================================
+
+def norm_id(x):
+
+    if x is None or pd.isna(x):
+        return None
+
+    x = str(x).strip()
+
+    if not x:
+        return None
+
+    x = re.sub(
+        r"^(transcript:|gene:|rna:)",
+        "",
+        x,
+    )
+
+    return x.split(".")[0]
+
+
+def safe_name(text):
+
+    return re.sub(
+        r"[^A-Za-z0-9_.-]+",
+        "_",
+        str(text),
+    )
+
+
+def calc_corr(
+    truth,
+    pred,
+):
+
+    truth = np.asarray(
+        truth,
+        dtype=float,
+    )
+
+    pred = np.asarray(
+        pred,
+        dtype=float,
+    )
+
+    if len(truth) < 2:
+
+        return (
+            np.nan,
+            np.nan,
+        )
+
+    pearson = pearsonr(
+        truth,
+        pred,
+    ).statistic
+
+    spearman = spearmanr(
+        truth,
+        pred,
+    ).statistic
+
+    return (
+        pearson,
+        spearman,
+    )
+
+
+# ============================================================
+# Truth
+# ============================================================
+
+def read_truth(path):
+
+    records = []
+
+    tid = None
+    plen = None
+
+    with open(path) as f:
+
+        for line in f:
+
+            line = line.strip()
+
+            if line.startswith("tid:"):
+
+                tid = norm_id(
+                    line.split(
+                        ":",
+                        1,
+                    )[1]
+                )
+
+            elif line.startswith("plen:"):
+
+                plen = int(
+                    line.split(
+                        ":",
+                        1,
+                    )[1]
+                )
+
+            elif line.startswith("rprofile:"):
+
+                counts = [
+                    int(x)
+                    for x in (
+                        line.split(
+                            ":",
+                            1,
+                        )[1]
+                        .split()
+                    )
+                ]
+
+                records.append({
+                    "transcript_id":
+                        tid,
+
+                    "truth_length":
+                        plen,
+
+                    "truth_count":
+                        sum(counts),
+                })
+
+    df = (
+        pd.DataFrame(
+            records
+        )
+        .groupby(
+            "transcript_id",
+            as_index=False,
+        )
+        .agg(
+            truth_length=(
+                "truth_length",
+                "max",
+            ),
+            truth_count=(
+                "truth_count",
+                "sum",
+            ),
+        )
+    )
+
+    rate = np.where(
+        df["truth_length"] > 0,
+        (
+            df["truth_count"]
+            /
+            df["truth_length"]
+        ),
+        0.0,
+    )
+
+    total = rate.sum()
+
+    df["Truth_tpm"] = (
+        rate
+        /
+        total
+        *
+        1_000_000
+        if total > 0
+        else 0.0
+    )
+
+    return df
+
+
+# ============================================================
+# RiboTxAlign
+# ============================================================
+
+def split_reference_ids(value):
+    """Split a reference_ids cell into individual RiboTxAlign reference IDs."""
+
+    if value is None or pd.isna(value):
+        return []
+
+    text = str(value).strip()
+
+    if not text:
+        return []
+
+    # Be tolerant of the separators used by upstream scripts.
+    return [
+        x.strip()
+        for x in re.split(r"[;,|]+", text)
+        if x.strip()
+    ]
+
+
+def read_ribotx_transcript_tpm(
+    path,
+    method_name,
+):
+    """
+    Read the merge-aware truth-transcript assignment table generated by
+    compare_simulation_longread_rnaseq_merge_aware.py.
+
+    In addition to the existing EM-merge classification, detect transcripts
+    that were already collapsed at reference construction time.
+
+    Operational definition of a reference merge:
+      if the SAME RiboTxAlign reference ID is associated with more than one
+      truth transcript in source_rescue_matching.tsv, all of those truth
+      transcripts are marked as reference_merged.
+
+    This is intentionally independent of match_type.  Therefore an
+    exact_source row can still be reference_merged.
+    """
+
+    df = pd.read_csv(
+        path,
+        sep="\t",
+        dtype=str,
+        keep_default_na=False,
+    )
+
+    tpm_col = f"{method_name}_tpm"
+    match_col = f"{method_name}_match_type"
+    ref_col = f"{method_name}_reference_ids"
+
+    required = {
+        "transcript_id",
+        tpm_col,
+        match_col,
+    }
+
+    missing = required - set(df.columns)
+
+    if missing:
+        raise ValueError(
+            f"{path} is missing columns: {sorted(missing)}"
+        )
+
+    df["transcript_id"] = (
+        df["transcript_id"]
+        .map(norm_id)
+    )
+
+    df[tpm_col] = (
+        pd.to_numeric(
+            df[tpm_col],
+            errors="coerce",
+        )
+        .fillna(0.0)
+    )
+
+    # --------------------------------------------------------
+    # Detect reference-construction collapse/merge.
+    # --------------------------------------------------------
+    if ref_col in df.columns:
+
+        ref_members = {}
+
+        for _, row in df[["transcript_id", ref_col]].iterrows():
+            tid = row["transcript_id"]
+
+            if tid is None:
+                continue
+
+            for ref_id in split_reference_ids(row[ref_col]):
+                ref_members.setdefault(ref_id, set()).add(tid)
+
+        ref_member_count = {
+            ref_id: len(tids)
+            for ref_id, tids in ref_members.items()
+        }
+
+        shared_refs = {
+            ref_id
+            for ref_id, n in ref_member_count.items()
+            if n > 1
+        }
+
+        def get_reference_merge_info(value):
+            refs = split_reference_ids(value)
+            shared = [r for r in refs if r in shared_refs]
+
+            if not shared:
+                return False, 1 if refs else 0
+
+            max_size = max(
+                ref_member_count[r]
+                for r in shared
+            )
+
+            return True, max_size
+
+        merge_info = df[ref_col].map(get_reference_merge_info)
+
+        df[f"{method_name}_reference_merged"] = merge_info.map(
+            lambda x: bool(x[0])
+        )
+
+        df[f"{method_name}_reference_merge_size"] = merge_info.map(
+            lambda x: int(x[1])
+        )
+
+        # Save the reference groups so suspicious points can be inspected.
+        reference_group_records = []
+
+        for ref_id in sorted(shared_refs):
+            members = sorted(ref_members[ref_id])
+            reference_group_records.append({
+                "reference_id": ref_id,
+                "n_truth_transcripts": len(members),
+                "truth_transcript_ids": ";".join(members),
+            })
+
+        reference_groups_path = (
+            PLOTS
+            / f"{safe_name(method_name)}.reference_merged_groups.tsv"
+        )
+
+        pd.DataFrame(reference_group_records).to_csv(
+            reference_groups_path,
+            sep="\t",
+            index=False,
+        )
+
+        print()
+        print(
+            f"{method_name} reference-construction merge detection:"
+        )
+        print(
+            "Shared reference IDs :",
+            f"{len(shared_refs):,}",
+        )
+        print(
+            "Rows reference-merged:",
+            f"{int(df[f'{method_name}_reference_merged'].sum()):,}",
+        )
+        print(
+            "Reference groups TSV :",
+            reference_groups_path,
+        )
+
+    else:
+        # Keep the plotting code functional even for older matching files.
+        df[f"{method_name}_reference_merged"] = False
+        df[f"{method_name}_reference_merge_size"] = 0
+
+        print()
+        print(
+            f"WARNING: {ref_col} not found; "
+            "reference-construction merges cannot be detected."
+        )
+
+    # Existing downstream EM-merge status.
+    df[f"{method_name}_em_merged"] = (
+        df[match_col]
+        .fillna("")
+        .astype(str)
+        .str.contains(
+            "em_merge_target",
+            regex=False,
+        )
+    )
+
+    # One row per truth transcript is expected, but group defensively.
+    result = (
+        df.groupby(
+            "transcript_id",
+            as_index=False,
+        )
+        .agg({
+            tpm_col: "sum",
+            match_col: (
+                lambda x: ";".join(
+                    sorted(
+                        set(
+                            str(v)
+                            for v in x
+                            if str(v)
+                        )
+                    )
+                )
+            ),
+            f"{method_name}_reference_merged": "max",
+            f"{method_name}_reference_merge_size": "max",
+            f"{method_name}_em_merged": "max",
+        })
+    )
+
+    print()
+    print(
+        f"{method_name} merge-aware match types:"
+    )
+
+    print(
+        df[match_col]
+        .value_counts()
+        .to_string()
+    )
+
+    ref_flag = f"{method_name}_reference_merged"
+    em_flag = f"{method_name}_em_merged"
+
+    status = np.select(
+        [
+            result[ref_flag] & result[em_flag],
+            result[ref_flag] & ~result[em_flag],
+            ~result[ref_flag] & result[em_flag],
+        ],
+        [
+            "reference_and_em_merge",
+            "reference_merge",
+            "em_merge",
+        ],
+        default="never_merged",
+    )
+
+    result[f"{method_name}_merge_status"] = status
+
+    print()
+    print(
+        f"{method_name} combined merge status:"
+    )
+    print(
+        result[f"{method_name}_merge_status"]
+        .value_counts()
+        .to_string()
+    )
+
+    return result
+
+
+# ============================================================
+# RiboMap
+# ============================================================
+
+def parse_gff3_attributes(text):
+    result = {}
+
+    for item in text.strip().split(";"):
+
+        if not item:
+            continue
+
+        if "=" in item:
+            key, value = item.split(
+                "=",
+                1,
+            )
+
+        else:
+            parts = item.split(
+                None,
+                1,
+            )
+
+            if len(parts) != 2:
+                continue
+
+            key, value = parts
+
+        result[
+            key.strip()
+        ] = (
+            value.strip()
+            .strip('"')
+        )
+
+    return result
+
+
+def read_cds_from_gencode_gff3(path):
+    """
+    Build transcript-level CDS lengths from Gencode GFF3.
+
+    CDS features can occur on multiple exons, so the CDS length for each
+    transcript is the SUM of all CDS feature lengths belonging to that
+    transcript.
+
+    Transcript IDs are normalized by removing version suffixes.
+    """
+
+    cds_length = {}
+
+    with open(path) as f:
+
+        for line in f:
+
+            if (
+                not line.strip()
+                or
+                line.startswith("#")
+            ):
+                continue
+
+            fields = line.rstrip().split("\t")
+
+            if len(fields) < 9:
+                continue
+
+            if fields[2] != "CDS":
+                continue
+
+            try:
+                start = int(
+                    fields[3]
+                )
+                end = int(
+                    fields[4]
+                )
+
+            except ValueError:
+                continue
+
+            length = (
+                end
+                -
+                start
+                +
+                1
+            )
+
+            if length <= 0:
+                continue
+
+            attr = parse_gff3_attributes(
+                fields[8]
+            )
+
+            transcript_ids = []
+
+            # Gencode GFF3 CDS entries generally contain Parent=transcript:ENST...
+            parent = attr.get(
+                "Parent"
+            )
+
+            if parent:
+                for value in re.split(
+                    r"[,]",
+                    parent,
+                ):
+                    tid = norm_id(
+                        value
+                    )
+
+                    if (
+                        tid
+                        and
+                        tid.startswith(
+                            "ENST"
+                        )
+                    ):
+                        transcript_ids.append(
+                            tid
+                        )
+
+            # Fallback for GTF-like attributes if present.
+            transcript_id = attr.get(
+                "transcript_id"
+            )
+
+            if transcript_id:
+                tid = norm_id(
+                    transcript_id
+                )
+
+                if (
+                    tid
+                    and
+                    tid.startswith(
+                        "ENST"
+                    )
+                ):
+                    transcript_ids.append(
+                        tid
+                    )
+
+            for tid in set(
+                transcript_ids
+            ):
+                cds_length[
+                    tid
+                ] = (
+                    cds_length.get(
+                        tid,
+                        0,
+                    )
+                    +
+                    length
+                )
+
+    df = pd.DataFrame({
+        "transcript_id":
+            list(
+                cds_length.keys()
+            ),
+        "cds_length":
+            list(
+                cds_length.values()
+            ),
+    })
+
+    print()
+    print("=" * 88)
+    print("GENCODE CDS LENGTHS")
+    print("=" * 88)
+    print(
+        "Transcripts with CDS length:",
+        len(df),
+    )
+
+    return df
+
+
+def read_ribomap(
+    stats_path,
+    cds,
+):
+    """
+    Read RiboMap transcript abundance and convert it to TPM using the
+    original definition:
+
+        rate = rabd / CDS_length
+        TPM  = rate / sum(rate) * 1e6
+
+    IMPORTANT:
+      - The reported transcript set is based on rabd > 0.
+      - CDS length comes from the SAME Gencode transcriptome used by
+        RiboMap, not from the simulation-only CDS file.
+    """
+
+    records = []
+
+    tid = None
+
+    with open(stats_path) as f:
+
+        for line in f:
+
+            line = line.strip()
+
+            if line.startswith("tid:"):
+
+                tid = norm_id(
+                    line.split(
+                        ":",
+                        1,
+                    )[1]
+                )
+
+            elif (
+                line.startswith("rabd:")
+                and
+                tid
+            ):
+
+                try:
+                    value = float(
+                        line.split(
+                            ":",
+                            1,
+                        )[1]
+                    )
+
+                except ValueError:
+                    continue
+
+                records.append({
+                    "transcript_id":
+                        tid,
+
+                    "rabd":
+                        value,
+                })
+
+    df = (
+        pd.DataFrame(
+            records
+        )
+        .groupby(
+            "transcript_id",
+            as_index=False,
+        )["rabd"]
+        .sum()
+        .merge(
+            cds,
+            on="transcript_id",
+            how="left",
+        )
+    )
+
+    positive = (
+        df["rabd"] > 0
+    )
+
+    missing_all = int(
+        df[
+            "cds_length"
+        ]
+        .isna()
+        .sum()
+    )
+
+    missing_positive = int(
+        (
+            positive
+            &
+            df[
+                "cds_length"
+            ]
+            .isna()
+        ).sum()
+    )
+
+    print()
+    print("=" * 88)
+    print("RIBOMAP LENGTH MATCHING")
+    print("=" * 88)
+    print(
+        "RiboMap transcripts:",
+        len(df),
+    )
+    print(
+        "RiboMap rabd > 0 transcripts:",
+        int(
+            positive.sum()
+        ),
+    )
+    print(
+        "Without Gencode CDS length:",
+        missing_all,
+    )
+    print(
+        "rabd > 0 without Gencode CDS length:",
+        missing_positive,
+    )
+
+    if missing_positive > 0:
+        missing_ids = (
+            df.loc[
+                positive
+                &
+                df[
+                    "cds_length"
+                ]
+                .isna(),
+                [
+                    "transcript_id",
+                    "rabd",
+                ],
+            ]
+            .copy()
+        )
+
+        missing_path = (
+            PLOTS
+            /
+            "RiboMap_positive_without_Gencode_CDS.tsv"
+        )
+
+        missing_ids.to_csv(
+            missing_path,
+            sep="\t",
+            index=False,
+        )
+
+        print(
+            "Missing-CDS list:",
+            missing_path,
+        )
+
+    # Keep the reported status independent of TPM calculation.
+    df[
+        "RiboMap_reported"
+    ] = positive
+
+    rate = np.where(
+        (
+            df[
+                "cds_length"
+            ].fillna(0) > 0
+        ),
+        (
+            df[
+                "rabd"
+            ]
+            /
+            df[
+                "cds_length"
+            ]
+        ),
+        0.0,
+    )
+
+    total = rate.sum()
+
+    df[
+        "RiboMap_tpm"
+    ] = (
+        rate
+        /
+        total
+        *
+        1_000_000
+        if total > 0
+        else 0.0
+    )
+
+    return df[
+        [
+            "transcript_id",
+            "RiboMap_tpm",
+            "RiboMap_reported",
+            "rabd",
+            "cds_length",
+        ]
+    ]
+
+
+# ============================================================
+# DeepShape
+# ============================================================
+
+def read_deepshape(path):
+
+    records = []
+
+    with open(path) as f:
+
+        for line in f:
+
+            line = line.strip()
+
+            if (
+                not line
+                or
+                line.startswith(
+                    "Loop "
+                )
+            ):
+                continue
+
+            fields = line.split(
+                "\t"
+            )
+
+            if len(fields) < 3:
+                continue
+
+            try:
+
+                tpm = float(
+                    fields[1]
+                )
+
+            except ValueError:
+
+                continue
+
+            tid = norm_id(
+                fields[0]
+            )
+
+            if tid is None:
+                continue
+
+            records.append({
+                "transcript_id":
+                    tid,
+
+                "DeepShape_tpm":
+                    tpm,
+            })
+
+    return (
+        pd.DataFrame(
+            records
+        )
+        .groupby(
+            "transcript_id",
+            as_index=False,
+        )["DeepShape_tpm"]
+        .sum()
+    )
+
+
+# ============================================================
+# Pairwise table
+# ============================================================
+
+def make_pairwise_table(
+    truth,
+    method_df,
+    method_name,
+):
+
+    method_col = (
+        f"{method_name}_tpm"
+    )
+
+    truth_positive = (
+        truth[
+            truth[
+                "Truth_tpm"
+            ] > 0
+        ][
+            [
+                "transcript_id",
+                "Truth_tpm",
+            ]
+        ]
+    )
+
+    if (
+        method_name == "RiboMap"
+        and
+        "RiboMap_reported"
+        in method_df.columns
+    ):
+
+        method_positive = (
+            method_df[
+                method_df[
+                    "RiboMap_reported"
+                ]
+            ][
+                [
+                    "transcript_id",
+                    method_col,
+                ]
+            ]
+        )
+
+    else:
+
+        keep_cols = [
+            "transcript_id",
+            method_col,
+        ]
+
+        optional_cols = [
+            f"{method_name}_match_type",
+            f"{method_name}_reference_merged",
+            f"{method_name}_reference_merge_size",
+            f"{method_name}_em_merged",
+            f"{method_name}_merge_status",
+        ]
+
+        for col in optional_cols:
+            if col in method_df.columns:
+                keep_cols.append(col)
+
+        method_positive = (
+            method_df[
+                method_df[
+                    method_col
+                ] > 0
+            ][
+                keep_cols
+            ]
+        )
+
+    truth_set = set(
+        truth_positive[
+            "transcript_id"
+        ]
+    )
+
+    method_set = set(
+        method_positive[
+            "transcript_id"
+        ]
+    )
+
+    union_ids = (
+        truth_set
+        |
+        method_set
+    )
+
+    pairwise = pd.DataFrame({
+        "transcript_id":
+            sorted(
+                union_ids
+            )
+    })
+
+    pairwise = (
+        pairwise
+        .merge(
+            truth_positive,
+            on="transcript_id",
+            how="left",
+        )
+        .merge(
+            method_positive,
+            on="transcript_id",
+            how="left",
+        )
+    )
+
+    pairwise[
+        "Truth_tpm"
+    ] = (
+        pairwise[
+            "Truth_tpm"
+        ]
+        .fillna(
+            0.0
+        )
+    )
+
+    pairwise[
+        method_col
+    ] = (
+        pairwise[
+            method_col
+        ]
+        .fillna(
+            0.0
+        )
+    )
+
+    pairwise[
+        "in_truth"
+    ] = (
+        pairwise[
+            "transcript_id"
+        ]
+        .isin(
+            truth_set
+        )
+    )
+
+    pairwise[
+        "in_method"
+    ] = (
+        pairwise[
+            "transcript_id"
+        ]
+        .isin(
+            method_set
+        )
+    )
+
+    pairwise[
+        "set_membership"
+    ] = np.select(
+        [
+            (
+                pairwise[
+                    "in_truth"
+                ]
+                &
+                pairwise[
+                    "in_method"
+                ]
+            ),
+            (
+                pairwise[
+                    "in_truth"
+                ]
+                &
+                ~pairwise[
+                    "in_method"
+                ]
+            ),
+            (
+                ~pairwise[
+                    "in_truth"
+                ]
+                &
+                pairwise[
+                    "in_method"
+                ]
+            ),
+        ],
+        [
+            "overlap",
+            "truth_only",
+            "method_only",
+        ],
+        default="neither",
+    )
+
+    return (
+        pairwise,
+        truth_set,
+        method_set,
+    )
+
+
+# ============================================================
+# Venn
+# ============================================================
+
+def plot_venn(
+    truth_set,
+    method_set,
+    method,
+):
+
+    fig = plt.figure(
+        figsize=(
+            6,
+            6,
+        )
+    )
+
+    venn2(
+        [
+            truth_set,
+            method_set,
+        ],
+        set_labels=(
+            "Truth TPM > 0",
+            f"{method} TPM > 0",
+        ),
+    )
+
+    plt.title(
+        f"{method}: reported transcripts vs truth"
+    )
+
+    path = (
+        PLOTS
+        / (
+            f"{safe_name(method)}"
+            "_truth_venn.png"
+        )
+    )
+
+    plt.savefig(
+        path,
+        dpi=300,
+        bbox_inches="tight",
+    )
+
+    plt.close(
+        fig
+    )
+
+    return path
+
+
+# ============================================================
+# Correlation
+# ============================================================
+
+def correlation_plot(
+    pairwise,
+    method,
+    set_type,
+):
+
+    method_col = (
+        f"{method}_tpm"
+    )
+
+    if set_type == "AND":
+
+        tmp = pairwise[
+            pairwise[
+                "in_truth"
+            ]
+            &
+            pairwise[
+                "in_method"
+            ]
+        ].copy()
+
+        subtitle = (
+            "AND: Truth > 0 and Method > 0"
+        )
+
+    elif set_type == "OR":
+
+        tmp = pairwise[
+            pairwise[
+                "in_truth"
+            ]
+            |
+            pairwise[
+                "in_method"
+            ]
+        ].copy()
+
+        subtitle = (
+            "OR: Truth > 0 or Method > 0; "
+            "missing side = 0"
+        )
+
+    else:
+
+        raise ValueError(
+            set_type
+        )
+
+    truth = (
+        tmp[
+            "Truth_tpm"
+        ]
+        .to_numpy(
+            float
+        )
+    )
+
+    pred = (
+        tmp[
+            method_col
+        ]
+        .to_numpy(
+            float
+        )
+    )
+
+    (
+        pearson,
+        spearman,
+    ) = calc_corr(
+        truth,
+        pred,
+    )
+
+    x = np.log10(
+        truth + 1
+    )
+
+    y = np.log10(
+        pred + 1
+    )
+
+    fig = plt.figure(
+        figsize=(
+            6,
+            6,
+        )
+    )
+
+    merge_status_col = f"{method}_merge_status"
+
+    if merge_status_col in tmp.columns:
+
+        status = (
+            tmp[merge_status_col]
+            .fillna("never_merged")
+            .astype(str)
+            .to_numpy()
+        )
+
+        plotting_groups = [
+            (
+                "never_merged",
+                "Never merged",
+                5,
+                0.35,
+                None,
+            ),
+            (
+                "reference_merge",
+                "Reference-merged",
+                12,
+                0.70,
+                "orange",
+            ),
+            (
+                "em_merge",
+                "EM-merged",
+                12,
+                0.70,
+                "red",
+            ),
+            (
+                "reference_and_em_merge",
+                "Reference + EM merged",
+                16,
+                0.80,
+                "purple",
+            ),
+        ]
+
+        for key, label, size, alpha, color in plotting_groups:
+            mask = status == key
+            n = int(mask.sum())
+
+            if n == 0:
+                continue
+
+            kwargs = {
+                "s": size,
+                "alpha": alpha,
+                "label": f"{label} (n={n:,})",
+            }
+
+            if color is not None:
+                kwargs["color"] = color
+
+            plt.scatter(
+                x[mask],
+                y[mask],
+                **kwargs,
+            )
+
+        plt.legend(
+            loc="lower right",
+            frameon=False,
+        )
+
+    else:
+
+        plt.scatter(
+            x,
+            y,
+            s=5,
+            alpha=0.4,
+        )
+
+    max_value = max(
+        x.max()
+        if len(x)
+        else 0,
+        y.max()
+        if len(y)
+        else 0,
+    )
+
+    plt.plot(
+        [
+            0,
+            max_value,
+        ],
+        [
+            0,
+            max_value,
+        ],
+        linewidth=1,
+    )
+
+    plt.xlabel(
+        "log10(Simulated transcript TPM + 1)"
+    )
+
+    plt.ylabel(
+        f"log10({method} transcript TPM + 1)"
+    )
+
+    plt.title(
+        f"{method} - {set_type}\n"
+        f"{subtitle}"
+    )
+
+    plt.text(
+        0.05,
+        0.95,
+        (
+            f"n = {len(tmp):,} transcripts\n"
+            f"Pearson r = {pearson:.3f}\n"
+            f"Spearman rho = {spearman:.3f}"
+        ),
+        transform=(
+            plt.gca()
+            .transAxes
+        ),
+        va="top",
+    )
+
+    plt.tight_layout()
+
+    path = (
+        PLOTS
+        / (
+            f"{safe_name(method)}"
+            f"_{set_type}_correlation.png"
+        )
+    )
+
+    plt.savefig(
+        path,
+        dpi=300,
+        bbox_inches="tight",
+    )
+
+    plt.close(
+        fig
+    )
+
+    return {
+        "method":
+            method,
+
+        "set":
+            set_type,
+
+        "transcripts":
+            len(tmp),
+
+        "pearson":
+            pearson,
+
+        "spearman":
+            spearman,
+
+        "plot_path":
+            str(path),
+    }
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+
+    truth = read_truth(
+        TRUTH_PROFILE
+    )
+
+    method_tables = {}
+
+    for method, path in (
+        RIBOTX_MATCHING_FILES.items()
+    ):
+
+        print(
+            method,
+            path,
+        )
+
+        if not path.exists():
+
+            raise FileNotFoundError(
+                f"Merge-aware matching file not found: "
+                f"{path}\n"
+                "Run "
+                "compare_simulation_longread_rnaseq_merge_aware.py "
+                "first."
+            )
+
+        method_tables[
+            method
+        ] = (
+            read_ribotx_transcript_tpm(
+                path,
+                method,
+            )
+        )
+
+    method_tables[
+        "RiboMap"
+    ] = read_ribomap(
+        RIBOMAP,
+        read_cds_from_gencode_gff3(
+            GENCODE_GFF3
+        ),
+    )
+
+    method_tables[
+        "DeepShape"
+    ] = read_deepshape(
+        DEEPSHAPE
+    )
+
+    count_records = []
+    corr_records = []
+
+    print()
+    print("=" * 88)
+    print("TRANSCRIPT-LEVEL REPORTED / TRUTH OVERLAP")
+    print("=" * 88)
+
+    truth_positive_n = int(
+        (
+            truth[
+                "Truth_tpm"
+            ] > 0
+        ).sum()
+    )
+
+    print(
+        "Truth transcripts:",
+        truth_positive_n,
+    )
+
+    for method, method_df in (
+        method_tables.items()
+    ):
+
+        (
+            pairwise,
+            truth_set,
+            method_set,
+        ) = make_pairwise_table(
+            truth,
+            method_df,
+            method,
+        )
+
+        overlap = (
+            truth_set
+            &
+            method_set
+        )
+
+        truth_only = (
+            truth_set
+            -
+            method_set
+        )
+
+        method_only = (
+            method_set
+            -
+            truth_set
+        )
+
+        union = (
+            truth_set
+            |
+            method_set
+        )
+
+        count_records.append({
+            "method":
+                method,
+
+            "truth_transcripts":
+                len(
+                    truth_set
+                ),
+
+            "reported_transcripts":
+                len(
+                    method_set
+                ),
+
+            "overlap_transcripts":
+                len(
+                    overlap
+                ),
+
+            "truth_only_transcripts":
+                len(
+                    truth_only
+                ),
+
+            "method_only_transcripts":
+                len(
+                    method_only
+                ),
+
+            "union_transcripts":
+                len(
+                    union
+                ),
+
+            "overlap_vs_truth_percent":
+                (
+                    len(
+                        overlap
+                    )
+                    /
+                    len(
+                        truth_set
+                    )
+                    *
+                    100
+                    if truth_set
+                    else np.nan
+                ),
+
+            "overlap_vs_reported_percent":
+                (
+                    len(
+                        overlap
+                    )
+                    /
+                    len(
+                        method_set
+                    )
+                    *
+                    100
+                    if method_set
+                    else np.nan
+                ),
+        })
+
+        print()
+        print(method)
+        print("-" * 88)
+
+        print(
+            "Truth transcripts    :",
+            f"{len(truth_set):,}",
+        )
+
+        print(
+            "Reported transcripts :",
+            f"{len(method_set):,}",
+        )
+
+        print(
+            "Overlap transcripts  :",
+            f"{len(overlap):,}",
+        )
+
+        print(
+            "Truth only           :",
+            f"{len(truth_only):,}",
+        )
+
+        print(
+            "Method only          :",
+            f"{len(method_only):,}",
+        )
+
+        print(
+            "Union transcripts    :",
+            f"{len(union):,}",
+        )
+
+        venn_path = plot_venn(
+            truth_set,
+            method_set,
+            method,
+        )
+
+        and_result = (
+            correlation_plot(
+                pairwise,
+                method,
+                "AND",
+            )
+        )
+
+        or_result = (
+            correlation_plot(
+                pairwise,
+                method,
+                "OR",
+            )
+        )
+
+        corr_records.extend([
+            and_result,
+            or_result,
+        ])
+
+        print(
+            "AND Pearson          :",
+            f"{and_result['pearson']:.4f}",
+        )
+
+        print(
+            "AND Spearman         :",
+            f"{and_result['spearman']:.4f}",
+        )
+
+        print(
+            "OR Pearson           :",
+            f"{or_result['pearson']:.4f}",
+        )
+
+        print(
+            "OR Spearman          :",
+            f"{or_result['spearman']:.4f}",
+        )
+
+        pairwise.to_csv(
+            PLOTS
+            / (
+                "transcript_pairwise_values."
+                f"{safe_name(method)}.tsv"
+            ),
+            sep="\t",
+            index=False,
+        )
+
+        print(
+            "Venn                 :",
+            venn_path,
+        )
+
+    count_df = pd.DataFrame(
+        count_records
+    )
+
+    corr_df = pd.DataFrame(
+        corr_records
+    )
+
+    counts_path = (
+        PLOTS
+        / "transcript_overlap_summary.tsv"
+    )
+
+    corr_path = (
+        PLOTS
+        / "transcript_AND_OR_correlation_summary.tsv"
+    )
+
+    count_df.to_csv(
+        counts_path,
+        sep="\t",
+        index=False,
+    )
+
+    corr_df.to_csv(
+        corr_path,
+        sep="\t",
+        index=False,
+    )
+
+    print()
+    print("=" * 88)
+    print("OUTPUT")
+    print("=" * 88)
+
+    print(
+        counts_path
+    )
+
+    print(
+        corr_path
+    )
+
+
+if __name__ == "__main__":
+    main()

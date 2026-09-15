@@ -91,6 +91,8 @@ def get_mapping_schema():
             ),
             ("reference_start", pa.int32()),
             ("reference_end", pa.int32()),
+            ("is_cds", pa.bool_()),
+            ("cds_source", pa.string()),
             ("query_start", pa.int32()),
             ("query_end", pa.int32()),
             ("strand", pa.int8()),
@@ -182,6 +184,8 @@ def alignments_to_rows(
                     alignment.reference_name
                 ),
                 "group_id": group_id,
+                "is_cds": alignment.is_cds,
+                "cds_source": alignment.cds_source,
                 "other_group_ids": [
                     candidate_group_id
                     for candidate_group_id

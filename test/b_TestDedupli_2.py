@@ -10,9 +10,11 @@ from de_duplication.umi_deduplication import (
 
 
 RIBO_FASTQ = (
-    "/mnt/share/project/riboML/riboseq_raw/trimmed_26_34/"
-    "SRR26942051.26_34.fastq.gz"
+    "/mnt/share/project/riboML/validation/HEK293T/riboseq/processed/clean/"
+    "SRR26942051.trimmed.clean.fastq.gz"
 )
+
+
 
 OUTPUT_DIR = Path(
     "/mnt/share/project/riboML/riboseq_raw/trimmed_26_34/deduplicated"
@@ -84,3 +86,4 @@ def run_test_deduplication() -> None:
 
 
 run_test_deduplication()
+

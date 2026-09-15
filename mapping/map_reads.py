@@ -9,6 +9,7 @@ from mapping.common import (
     read_fastq_batches,
 )
 from mapping.mappy_mapper import MappyMapper
+from mapping.alt_tie_policy import prefer_primary_alt_ties
 from mapping.parquet_writer import (
     MappingBatchPartWriter,
 )
@@ -50,6 +51,9 @@ def run_transcript_mapping_to_parquet(
     parquet_row_group_size: int = 100000,
     progress_interval: int = 100000,
     log_file: str | None = None,
+    prefer_primary_on_alt_tie: bool = False,
+    reference_metadata_tsv: str | None = None,
+    reference_gtf: str | None = None,
 ) -> MappingCounters:
     """
     Map reads and write chromosome/strand Parquet part files.
@@ -84,6 +88,8 @@ def run_transcript_mapping_to_parquet(
 
     mapper = MappyMapper(
         reference_path=transcript_fasta,
+        reference_metadata_tsv=reference_metadata_tsv,
+        reference_gtf=reference_gtf,
         maximum_candidates=maximum_candidates,
         index_threads=1,
         kmer_size=kmer_size,
@@ -149,6 +155,11 @@ def run_transcript_mapping_to_parquet(
                 counters.unmapped_reads += 1
                 continue
 
+            alignments, removed_alt_hits = prefer_primary_alt_ties(
+                alignments, enabled=prefer_primary_on_alt_tie, limit_reached=limit_reached,
+            )
+            counters.primary_preferred_alt_tie_reads += int(removed_alt_hits > 0)
+            counters.removed_alt_tie_hits += removed_alt_hits
             counters.mapped_reads += 1
 
             batch_writer.add_read(
@@ -268,4 +279,6 @@ def run_transcript_mapping_to_parquet(
         speed,
     )
 
+    logger.info("Primary-preferred ALT ties: %d reads, %d ALT hits removed",
+                counters.primary_preferred_alt_tie_reads, counters.removed_alt_tie_hits)
     return counters

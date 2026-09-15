@@ -4,7 +4,7 @@ from pathlib import Path
 
 import click
 
-from pipeline.ribotxalign_pipeline import (
+from RiboTxAlign_pipeline import (
     build_paths,
     cleanup_deduplication_intermediates,
     ensure_parent_directories,
@@ -129,28 +129,26 @@ def create_reference_command(
     click.echo(f"Reference prefix: {paths.reference_prefix}")
 
 
+
+
 @cli.command("deduplicate")
+@_fastq_option
 @click.option(
-    "--config",
-    "config_path",
+    "--output-fastq",
     required=True,
     type=click.Path(
-        exists=True,
         dir_okay=False,
         path_type=Path,
     ),
-    help="Pipeline YAML file containing analysis settings.",
+    help="Output deduplicated FASTQ.GZ file.",
 )
-@_sample_option
-@_output_option
-@_fastq_option
 def deduplicate_command(
-    config_path: Path,
-    sample_name: str,
-    output_dir: Path,
     fastq: Path,
+    output_fastq: Path,
 ) -> None:
-    """Run step b: perform mapping-free UMI deduplication."""
+    """Perform mapping-free UMI deduplication."""
+
+    import shutil
 
     from de_duplication.umi_deduplication import (
         process_buckets,
@@ -158,37 +156,60 @@ def deduplicate_command(
         write_stats,
     )
 
-    config = load_yaml(config_path)
-    paths = build_paths(
-        sample_name=sample_name,
-        output_dir=output_dir,
-        input_fastq=fastq,
-    )
-    ensure_parent_directories(paths)
+    fastq = fastq.resolve()
+    output_fastq = output_fastq.resolve()
 
-    stage("b", "Deduplicating the input FASTQ")
+    output_fastq.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    bucket_dir = Path(
+        f"{output_fastq}.umi_buckets"
+    )
+
+    stats_path = Path(
+        f"{output_fastq}.stats.tsv"
+    )
+
+    stage(
+        "b",
+        "Deduplicating the input FASTQ",
+    )
+
     bucket_stats = split_fastq_into_buckets(
-        input_fastq=paths.input_fastq,
-        output_dir=paths.dedup_bucket_dir,
+        input_fastq=fastq,
+        output_dir=bucket_dir,
     )
+
     collapse_stats = process_buckets(
-        bucket_dir=paths.dedup_bucket_dir,
-        output_fastq_gz=paths.deduplicated_fastq,
+        bucket_dir=bucket_dir,
+        output_fastq_gz=output_fastq,
     )
+
     write_stats(
-        path=paths.dedup_stats,
+        path=stats_path,
         bucket_stats=bucket_stats,
         collapse_stats=collapse_stats,
     )
-    cleanup_deduplication_intermediates(
-        config=config,
-        paths=paths,
+
+    shutil.rmtree(
+        bucket_dir,
+        ignore_errors=True,
     )
 
-    click.echo(f"Input reads: {bucket_stats.total_reads:,}")
-    click.echo(f"Output reads: {collapse_stats.output_reads:,}")
-    click.echo(f"Deduplicated FASTQ: {paths.deduplicated_fastq}")
-
+    click.echo(
+        f"Input reads: {bucket_stats.total_reads:,}"
+    )
+    click.echo(
+        f"Output reads: {collapse_stats.output_reads:,}"
+    )
+    click.echo(
+        f"Deduplicated FASTQ: {output_fastq}"
+    )
+    click.echo(
+        f"Statistics: {stats_path}"
+    )
 
 @cli.command("run")
 @click.option(

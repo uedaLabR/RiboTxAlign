@@ -85,43 +85,240 @@ def resolve_merge_map(
 
     return resolved_map
 
+def has_unique_evidence(
+    transcript_id,
+    unique_read_indexes,
+):
+    """Return True when a transcript has at least one observed unique read."""
+
+    return bool(
+        unique_read_indexes.get(
+            transcript_id,
+            set(),
+        )
+    )
+
+
+def get_multi_read_evidence(
+    transcript_id,
+    multi_read_indexes,
+):
+    """Return the observed multi-read index set for one transcript."""
+
+    return multi_read_indexes.get(
+        transcript_id,
+        set(),
+    )
+
+
+def have_identical_multi_read_evidence(
+    transcript_id_1,
+    transcript_id_2,
+    multi_read_indexes,
+):
+    """Return True when two transcripts have the same non-empty multi-read set."""
+
+    reads_1 = get_multi_read_evidence(
+        transcript_id_1,
+        multi_read_indexes,
+    )
+
+    reads_2 = get_multi_read_evidence(
+        transcript_id_2,
+        multi_read_indexes,
+    )
+
+    return bool(
+        reads_1
+        and reads_1 == reads_2
+    )
+
+
+def get_reference_rna_tpm(
+    transcript_id,
+    reference_definitions,
+):
+    """Return non-negative RNA-seq TPM stored in reference metadata."""
+
+    try:
+        rna_tpm = float(
+            reference_definitions[
+                transcript_id
+            ].get(
+                "rna_tpm",
+                0.0,
+            )
+        )
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
+        return 0.0
+
+    return max(
+        rna_tpm,
+        0.0,
+    )
+
+
+def select_merge_representative(
+    transcript_ids,
+    reference_definitions,
+):
+    """Select the highest-RNA-TPM transcript as merge representative."""
+
+    def sort_key(
+        transcript_id,
+    ):
+        definition = reference_definitions.get(
+            transcript_id,
+            {},
+        )
+
+        rna_tpm = get_reference_rna_tpm(
+            transcript_id,
+            reference_definitions,
+        )
+
+        cds_length = int(
+            definition.get(
+                "cds_length",
+                0,
+            )
+            or 0
+        )
+
+        transcript_length = int(
+            definition.get(
+                "transcript_length",
+                0,
+            )
+            or 0
+        )
+
+        effective_length = (
+            cds_length
+            if cds_length > 0
+            else transcript_length
+        )
+
+        # Highest RNA TPM first.
+        # Length and transcript ID are deterministic tie-breakers only.
+        return (
+            -rna_tpm,
+            effective_length,
+            transcript_id,
+        )
+
+    return sorted(
+        transcript_ids,
+        key=sort_key,
+    )[0]
+
+
+def find_indistinguishable_merges(
+    transcript_ids,
+    unique_read_indexes,
+    multi_read_indexes,
+    reference_definitions,
+):
+    """Find transcripts that are observationally indistinguishable.
+
+    A transcript is eligible for merging only when:
+      1. it has no observed transcript-unique read;
+      2. another transcript also has no observed transcript-unique read;
+      3. their observed non-empty multi-read sets are identical.
+
+    Strict-subset relationships are NOT merged. This preserves cases such
+    as A-B-C-D versus A-B-C, where reads unique to D can constrain the
+    abundance of the longer transcript and shared A-B-C depth can still
+    support the shorter transcript during EM.
+
+    Within each indistinguishable set, the transcript with the highest
+    RNA-seq TPM is retained as the representative.
+    """
+
+    transcript_ids = sorted(
+        transcript_ids
+    )
+
+    eligible_ids = [
+        transcript_id
+        for transcript_id in transcript_ids
+        if (
+            not has_unique_evidence(
+                transcript_id,
+                unique_read_indexes,
+            )
+            and get_multi_read_evidence(
+                transcript_id,
+                multi_read_indexes,
+            )
+        )
+    ]
+
+    evidence_groups = defaultdict(list)
+
+    for transcript_id in eligible_ids:
+        evidence_key = frozenset(
+            get_multi_read_evidence(
+                transcript_id,
+                multi_read_indexes,
+            )
+        )
+
+        evidence_groups[
+            evidence_key
+        ].append(
+            transcript_id
+        )
+
+    merge_map = {}
+
+    for indistinguishable_ids in (
+        evidence_groups.values()
+    ):
+        if len(indistinguishable_ids) <= 1:
+            continue
+
+        representative_id = (
+            select_merge_representative(
+                transcript_ids=(
+                    indistinguishable_ids
+                ),
+                reference_definitions=(
+                    reference_definitions
+                ),
+            )
+        )
+
+        for transcript_id in indistinguishable_ids:
+            if transcript_id == representative_id:
+                continue
+
+            merge_map[
+                transcript_id
+            ] = representative_id
+
+    return merge_map
+
+
+# Backward-compatible name for callers outside this module.
 def find_subset_merges(
     transcript_ids,
     unique_read_indexes,
     multi_read_indexes,
+    reference_definitions,
 ):
-    merge_map = {}
+    """Compatibility wrapper for the former merge function name."""
 
-    for transcript_id in transcript_ids:
-        if unique_read_indexes.get(
-            transcript_id,
-            set(),
-        ):
-            continue
-
-        source_reads = multi_read_indexes.get(
-            transcript_id,
-            set(),
-        )
-
-        for other_id in transcript_ids:
-            if other_id == transcript_id:
-                continue
-
-            other_reads = multi_read_indexes.get(
-                other_id,
-                set(),
-            )
-
-            if source_reads < other_reads:
-                merge_map[transcript_id] = other_id
-                break
-
-    if len(merge_map) > 1:
-        merge_map = resolve_merge_map(merge_map)
-
-    return merge_map
-
+    return find_indistinguishable_merges(
+        transcript_ids=transcript_ids,
+        unique_read_indexes=unique_read_indexes,
+        multi_read_indexes=multi_read_indexes,
+        reference_definitions=reference_definitions,
+    )
 
 def merge_transcripts(
     group_id,
@@ -170,13 +367,12 @@ def _alignment_record_priority(
     record,
     merged_transcript_id,
 ):
-    """Return a deterministic priority for one merged alignment record.
+    """Return deterministic priority for a merged alignment record."""
 
-    A hit aligned directly to the representative transcript is preferred.
-    Remaining ties are resolved by hit index and original transcript ID.
-    """
-
-    original_transcript_id = record["transcript_id"]
+    original_transcript_id = record.get(
+        "alignment_transcript_id",
+        record["transcript_id"],
+    )
 
     return (
         0 if original_transcript_id == merged_transcript_id else 1,
@@ -185,7 +381,6 @@ def _alignment_record_priority(
         int(record.get("reference_start", 0)),
         int(record.get("reference_end", 0)),
     )
-
 
 def apply_transcript_merges(
     group_records,
@@ -263,10 +458,11 @@ def process_multi_transcript_group(
         group_records
     )
 
-    merge_map = find_subset_merges(
+    merge_map = find_indistinguishable_merges(
         transcript_ids=transcript_ids,
         unique_read_indexes=unique_read_indexes,
         multi_read_indexes=multi_read_indexes,
+        reference_definitions=reference_definitions,
     )
 
     if merge_map:
@@ -289,6 +485,7 @@ def process_multi_transcript_group(
 
         # The group became a single-transcript group after merging.
         if len(transcript_ids) == 1:
+
             transcript_id = next(
                 iter(transcript_ids)
             )
@@ -301,13 +498,102 @@ def process_multi_transcript_group(
                 reads_info=reads_info,
                 transcript_tpm=transcript_tpm,
             )
-            return
+
+            # Calculate expected read count.
+            expected_count = 0.0
+            seen_reads = set()
+
+            for record in group_records:
+
+                read_id = record["read_id"]
+
+                if read_id in seen_reads:
+                    continue
+
+                seen_reads.add(
+                    read_id
+                )
+
+                other_group_ids = record.get(
+                    "other_group_ids",
+                    [],
+                )
+
+                if other_group_ids is None:
+                    other_group_ids = []
+
+                expected_count += calculate_group_probability(
+                    group_id=group_id,
+                    other_group_ids=other_group_ids,
+                    group_tpm=group_tpm,
+                )
+
+            original_cds_length = int(
+                reference_definitions[
+                    transcript_id
+                ].get(
+                    "cds_length",
+                    0,
+                )
+            )
+
+            transcript_length = int(
+                reference_definitions[
+                    transcript_id
+                ].get(
+                    "transcript_length",
+                    1,
+                )
+            )
+
+            em_cds_length = (
+                reference_definitions[transcript_id].get(
+                    "em_region_length",
+                    original_cds_length if original_cds_length > 0 else transcript_length,
+                )
+            )
+
+            return (
+                {
+                    transcript_id: expected_count,
+                },
+                {
+                    transcript_id: original_cds_length,
+                },
+                {
+                    transcript_id: em_cds_length,
+                },
+            )
+
+    # --------------------------------------------------------
+    # Original CDS lengths
+    # --------------------------------------------------------
+
+    original_cds_lengths = {
+        transcript_id: int(
+            reference_definitions[
+                transcript_id
+            ].get(
+                "cds_length",
+                0,
+            )
+        )
+        for transcript_id in transcript_ids
+    }
+
+    # --------------------------------------------------------
+    # Unique effective lengths
+    # --------------------------------------------------------
 
     transcript_unique_lengths = determine_unique_transcript_lengths(
         transcript_ids=transcript_ids,
         reference_definitions=reference_definitions,
         unique_junction_length=50,
     )
+
+    # --------------------------------------------------------
+    # Updated lengths actually used by transcript EM
+    # --------------------------------------------------------
 
     transcript_cds_lengths = determine_transcript_lengths(
         transcript_ids=transcript_ids,
@@ -318,8 +604,14 @@ def process_multi_transcript_group(
         minimum_transcript_fraction=1.0 / 3.0,
     )
 
-    # Transcript-level EM will start from here.
-    execute_transcript_em_eachgroup(
+    # --------------------------------------------------------
+    # Transcript-level EM
+    # --------------------------------------------------------
+
+    (
+        final_tpm,
+        final_expected_counts,
+    ) = execute_transcript_em_eachgroup(
         group_id=group_id,
         transcript_ids=transcript_ids,
         group_records=group_records,
@@ -328,4 +620,11 @@ def process_multi_transcript_group(
         transcript_cds_lengths=transcript_cds_lengths,
         reads_info=reads_info,
         transcript_tpm=transcript_tpm,
+        reference_definitions=reference_definitions,
+    )
+
+    return (
+        final_expected_counts,
+        original_cds_lengths,
+        transcript_cds_lengths,
     )

@@ -3,6 +3,7 @@ from __future__ import annotations
 import mappy as mp
 
 from mapping.mapping_result import RawAlignment
+from mapping.cds_policy import load_mapping_cds_regions, prefer_cds_hits
 
 
 class MappyMapper:
@@ -21,6 +22,8 @@ class MappyMapper:
         index_threads: int = 1,
         minimum_query_coverage: float = 0.85,
         minimum_identity: float = 0.90,
+        reference_metadata_tsv: str | None = None,
+        reference_gtf: str | None = None,
     ) -> None:
         if maximum_candidates < 1:
             raise ValueError("maximum_candidates must be at least 1.")
@@ -28,6 +31,9 @@ class MappyMapper:
         self.maximum_candidates = maximum_candidates
         self.minimum_query_coverage = minimum_query_coverage
         self.minimum_identity = minimum_identity
+        self.cds_regions = load_mapping_cds_regions(
+            reference_path, reference_metadata_tsv, reference_gtf,
+        )
 
         # Request one extra candidate so a best-score overflow can be
         # detected when more than maximum_candidates equal best hits exist.
@@ -60,7 +66,8 @@ class MappyMapper:
 
         Query coverage and identity filters are applied first. Among the
         surviving alignments, only alignments with the maximum internal score
-        are retained. Lower-scoring alignments are discarded.
+        are retained. Lower-scoring alignments are discarded. Within these
+        ties, CDS hits take priority before the candidate limit is applied.
         """
 
         read_length = len(sequence)
@@ -113,6 +120,7 @@ class MappyMapper:
             if alignment.score == best_score
         ]
 
+        best_hits = prefer_cds_hits(best_hits, self.cds_regions)
         best_hits.sort(
             key=lambda alignment: (
                 alignment.reference_name,

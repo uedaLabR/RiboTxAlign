@@ -26,6 +26,10 @@ def load_reference_metadata(metadata_tsv):
                 "group_id": row["overlap_group_id"],
                 "transcript_length": int(row["transcript_length"]),
                 "cds_length": int(row["cds_length"]),
+                "strand": row.get("strand", ""),
+                "chromosome": row.get("chromosome", ""),
+                **{key: (int(row[key]) if row.get(key) not in (None, "", ".") else None)
+                   for key in ("cds_start", "cds_end", "cds_reference_start", "cds_reference_end")},
                 "exons": [],
             }
 
@@ -63,6 +67,9 @@ def load_reference_exons(reference_gtf, reference_definitions):
 
             if transcript_id not in reference_definitions:
                 continue
+
+            reference_definitions[transcript_id]["strand"] = columns[6]
+            reference_definitions[transcript_id]["chromosome"] = columns[0]
 
             reference_definitions[transcript_id]["exons"].append(
                 (
@@ -213,6 +220,9 @@ def determine_transcript_lengths(
 
     for transcript_id in transcript_ids:
         definition = reference_definitions[transcript_id]
+        if "em_region_length" in definition:
+            transcript_lengths[transcript_id] = definition["em_region_length"]
+            continue
         annotated_cds_length = definition["cds_length"]
 
         if annotated_cds_length > 0:

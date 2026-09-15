@@ -20,6 +20,7 @@ from mapping.common import (
     read_fastq_batches,
 )
 from mapping.mappy_mapper import MappyMapper
+from mapping.alt_tie_policy import prefer_primary_alt_ties
 from mapping.mapping_stats import (
     percentage,
     write_mapping_stats,
@@ -46,6 +47,7 @@ class WorkerTask:
     exclude_decoy_reads: bool
     decoy_reference_patterns: tuple[str, ...]
     unmapped_fastq_part: str | None
+    prefer_primary_on_alt_tie: bool = False
 
 
 @dataclass(slots=True)
@@ -150,6 +152,8 @@ def initialize_worker(
     minimum_dp_score: int,
     minimum_query_coverage: float,
     minimum_identity: float,
+    reference_metadata_tsv: str | None = None,
+    reference_gtf: str | None = None,
 ) -> None:
     """Create one independent mapper in each worker process."""
 
@@ -157,6 +161,8 @@ def initialize_worker(
 
     _WORKER_MAPPER = MappyMapper(
         reference_path=transcript_fasta,
+        reference_metadata_tsv=reference_metadata_tsv,
+        reference_gtf=reference_gtf,
         maximum_candidates=maximum_candidates,
         index_threads=1,
         kmer_size=kmer_size,
@@ -251,6 +257,13 @@ def map_and_write_chunk(
                 decoy_filtered_read_count += 1
                 continue
 
+            alignments, removed_alt_hits = prefer_primary_alt_ties(
+                alignments, enabled=task.prefer_primary_on_alt_tie,
+                limit_reached=limit_reached,
+            )
+            counters.primary_preferred_alt_tie_reads += int(removed_alt_hits > 0)
+            counters.removed_alt_tie_hits += removed_alt_hits
+
             counters.mapped_reads += 1
             mapped_read_count += 1
 
@@ -344,6 +357,10 @@ def run_transcript_mapping_to_parquet_mt(
     unmapped_fastq_path: str | None = None,
     stats_json_path: str | None = None,
     multiprocessing_start_method: str = "spawn",
+    prefer_primary_on_alt_tie: bool = False,
+    reference_metadata_tsv: str | None = None,
+    reference_gtf: str | None = None,
+    overwrite: bool = True,
 ) -> MappingCounters:
     """
     Map reads and write worker-level chromosome Parquet parts.
@@ -359,6 +376,11 @@ def run_transcript_mapping_to_parquet_mt(
 
     Strand remains in group IDs and row data, but plus and minus strands
     are not written to separate files.
+
+    By default, all old mapping parts are removed before processing reads
+    and mapping restarts from the first read. Set overwrite=False to reject
+    existing parts instead. This does not resume an interrupted run. Use a
+    separate directory for each concurrently running mapping job.
     """
 
     if worker_count < 1:
@@ -386,6 +408,17 @@ def run_transcript_mapping_to_parquet_mt(
         exist_ok=True,
     )
 
+    existing_parts = sorted(output_directory.glob("*.part[0-9]*.parquet"))
+    if existing_parts and not overwrite:
+        raise FileExistsError(
+            f"Mapping parts directory already contains {len(existing_parts)} "
+            f"part file(s), including: {existing_parts[0]}. "
+            "Use a fresh output directory, move the old parts aside, or set "
+            "mapping.overwrite: true in the pipeline YAML (overwrite=True "
+            "in the Python API) to restart mapping from the first read. "
+            "Do not run multiple mapping jobs in the same output directory."
+        )
+
     if log_file is None:
         log_file = str(
             output_directory
@@ -396,6 +429,11 @@ def run_transcript_mapping_to_parquet_mt(
         "RiboTxAlignMT",
         log_file,
     )
+
+    if existing_parts:
+        logger.info("Removing %d existing mapping parts for a fresh run", len(existing_parts))
+        for part_path in existing_parts:
+            part_path.unlink()
 
     counters = MappingCounters()
     decoy_filtered_read_count = 0
@@ -486,6 +524,8 @@ def run_transcript_mapping_to_parquet_mt(
             minimum_dp_score,
             minimum_query_coverage,
             minimum_identity,
+            reference_metadata_tsv,
+            reference_gtf,
         ),
     ) as executor:
         for fastq_batch_index, batch in enumerate(
@@ -504,6 +544,7 @@ def run_transcript_mapping_to_parquet_mt(
 
             tasks = [
                 WorkerTask(
+                    prefer_primary_on_alt_tie=prefer_primary_on_alt_tie,
                     reads=chunk,
                     output_directory=str(
                         output_directory
@@ -693,6 +734,8 @@ def run_transcript_mapping_to_parquet_mt(
         speed,
     )
 
+    logger.info("Primary-preferred ALT ties: %d reads, %d ALT hits removed",
+                counters.primary_preferred_alt_tie_reads, counters.removed_alt_tie_hits)
     if stats_json_path is not None:
         analyzable_reads = (
             counters.total_reads
@@ -706,6 +749,9 @@ def run_transcript_mapping_to_parquet_mt(
             "transcript_unmapped": counters.unmapped_reads,
             "decoy_filtered": decoy_filtered_read_count,
             "best_hit_limit_reached": counters.best_hit_overflow_reads,
+            "prefer_primary_on_alt_tie": prefer_primary_on_alt_tie,
+            "primary_preferred_alt_tie_reads": counters.primary_preferred_alt_tie_reads,
+            "removed_alt_tie_hits": counters.removed_alt_tie_hits,
             "analyzable_reads": analyzable_reads,
             "transcript_mapped_rate_percent": percentage(
                 counters.mapped_reads, counters.total_reads
