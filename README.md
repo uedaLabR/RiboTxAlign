@@ -1,103 +1,46 @@
 # RiboTxAlign
 
-RiboTxAlign builds a sample-specific transcript reference, maps short single-end Ribo-seq reads, estimates transcript-group abundance by EM, rescues transcript-unmapped reads by contiguous and conservative splice-aware genome mapping, creates depth tracks, and writes a final genome-coordinate BAM.
+RiboTxAlign maps short, single-end ribosome profiling (Ribo-seq) reads to a sample-specific spliced transcript reference built from StringTie assemblies and GENCODE annotation. Two sequential expectation-maximization (EM) stages estimate support between transcript groups and within each group. The workflow produces fractional abundance estimates, posterior-weighted profiles, and a genome-coordinate BAM, including eligible reads recovered by genome rescue.
 
-The sample-specific values are supplied as command-line options. The YAML file contains stable reference paths and analysis parameters. Output names are generated centrally from `--sample-name`, so the names remain consistent throughout the workflow.
+RNA-seq assembly is performed upstream. Either short-read- or long-read-derived StringTie models can be supplied. Estimated transcript support is not, by itself, proof that an individual isoform is actively translated.
 
-## Workflow
+## Entry points
 
-The original test scripts `a` to `l` are represented by three commands:
+| File | Role |
+|---|---|
+| `RiboTxAlign_Cmd.py` | User-facing command-line interface: `create-reference`, `deduplicate`, and `run` |
+| `RiboTxAlign_pipeline.py` | Internal workflow implementation: paths, configuration, stages, child processes, validation, and cleanup |
 
-| Command | Steps | Purpose |
-|---|---:|---|
-| `create-reference` | a | Build the transcript reference from GENCODE, StringTie2, and the genome FASTA |
-| `deduplicate` | b | Perform mapping-free UMI deduplication |
-| `run` | c–l | Transcript mapping, Parquet ordering, EM, depth tracks, genome assignment, genome rescue, BAM merge, sorting, indexing, and validation |
-
-During `run`, one progress line is printed before each stage:
-
-```text
-[c] Mapping reads to the transcript reference
-[d] Sorting mapping Parquet files by group
-[e] Preparing group-level EM input
-[f] Estimating group-level TPM by EM
-[g] Estimating transcript probabilities within groups
-[h] Creating transcript and genome depth tracks
-[i] Assigning one genomic alignment to each mapped read
-[j] Writing the unsorted transcript-supported genome BAM
-[k] Rescuing unique genome alignments from transcript-unmapped reads
-[l] Merging, coordinate-sorting, indexing, and validating the final BAM
-```
-
-## CDS preference during transcript mapping
-
-Within each read's highest-score mapping ties, CDS-overlapping hits are
-preferred: if any candidate overlaps CDS, non-CDS candidates are removed
-before the candidate limit and group counts are calculated. If no candidate
-overlaps CDS, all best-score candidates remain. Overlap means at least one
-base of the alignment's reference interval overlaps a CDS interval.
-
-A transcript's own CDS definition takes priority. When it has no CDS,
-the minimum genomic CDS start and maximum genomic CDS end among annotated
-references in the same exon-overlap group, chromosome, and strand are
-projected onto its own exons (including reverse-strand coordinate conversion).
-This supplies a CDS estimate for StringTie references without their own
-definition. A read-derived span is never treated as CDS evidence.
-
-Mapping Parquet includes `is_cds` and `cds_source` (`own_cds`, `group_cds`,
-or `unresolved`). The pipeline passes the reference metadata TSV and GTF
-explicitly. Standalone mapping functions accept `reference_metadata_tsv`
-and `reference_gtf`, or discover `<FASTA-prefix>.metadata.tsv` and
-`<FASTA-prefix>.gtf`; missing discovered files produce a warning and disable
-CDS preference. Explicit missing paths are errors.
-
-Regenerate mapping and downstream outputs from stage c to apply this policy
-to existing analyses. Use a fresh output directory to avoid mixing old and
-new Parquet schemas. Transcript EM also retains reads having only non-CDS
-candidates.
-
-## Requirements
-
-- Linux
-- Python 3.10 or later
-- Genome FASTA and FASTA index (`.fai`)
-- GENCODE GFF3 annotation
-- StringTie2 GTF
-- Single-end Ribo-seq FASTQ or FASTQ.GZ
-
-Python dependencies:
-
-- Click
-- PyYAML
-- mappy
-- NumPy
-- pandas
-- PyArrow
-- pyBigWig (for the default BigWig depth outputs)
-- pysam
+Start analyses with **`python RiboTxAlign_Cmd.py`**. The pipeline module is imported by the CLI; it has no standalone command-line entry point. Keep both files and the repository's package directories together.
 
 ## Installation
+
+Use Linux with Python 3.10 or later. From a source checkout:
 
 ```bash
 git clone https://github.com/uedaLabR/RiboTxAlign.git
 cd RiboTxAlign
-
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e .
+python -m pip install -r requirements.txt
+# For BigWig tracks and profile plots:
+python -m pip install pyBigWig matplotlib
+python RiboTxAlign_Cmd.py --help
 ```
 
-Confirm the command:
+The examples below run from the repository root. The current packaging metadata does not include all workflow modules and dependencies, so use the source-checkout commands rather than relying on a standalone wheel installation. The CLI and package metadata also currently report different version strings; record the source commit for reproducible analyses.
 
-```bash
-ribotxalign --help
-ribotxalign --version
-```
+## Inputs and configuration
 
-## Configuration
+Required inputs are:
 
-The YAML file contains values that normally remain unchanged between samples:
+- Genome FASTA and its `.fai` index, with chromosome names matching the annotation.
+- GENCODE GFF3 annotation.
+- A StringTie transcript GTF containing transcript structures and RNA abundance information.
+- Single-end Ribo-seq FASTQ or FASTQ.GZ, after the desired adapter, length, and contaminant filtering.
+
+Copy `RiboTxAlign_human.yaml` or `RiboTxAlign_mouse.yaml` and replace the reference paths. These files contain example machine-specific paths, not portable reference downloads.
 
 ```yaml
 reference:
@@ -106,288 +49,157 @@ reference:
   genome_fai: /path/to/genome.fa.fai
 
 pipeline:
-  delete_intermediate_files: true
+  delete_intermediate_files: false
+  start_method: spawn
 ```
 
-The following sample-specific values are command-line options and are not stored in the YAML file:
+`genome_fai` defaults to `<genome_fasta>.fai`. YAML paths are resolved relative to the YAML file; command-line paths are resolved relative to the current directory. Sample name, output directory, FASTQ, and StringTie GTF are supplied on the command line.
 
-```text
---sample-name
---output-dir
---fastq
---stringtie-gtf
-```
+**`run` always reads the file supplied by `--fastq`.** The legacy `pipeline.use_deduplicated_fastq` setting present in the example YAML files is not used by the current pipeline. Deduplication must be run separately, and its output passed explicitly to `run`.
 
-`reference.genome_fai` may be omitted when the index is located at `<genome_fasta>.fai`. All analysis parameters have defaults. `RiboTxAlign_human.yaml` and `RiboTxAlign_mouse.yaml` contain the available settings used by the current pipeline. Relative paths in the YAML file are resolved relative to the YAML file itself. Command-line paths are resolved from the current working directory.
+## Quick start
 
-Genome rescue uses `rescue.contiguous_preset` (default `sr`) and
-`rescue.splice_preset` (default `splice`). `rescue.preset` is not a supported
-setting.
-
-## Commands
-
-Use the same `--sample-name` and `--output-dir` for `create-reference` and `run`.
-`deduplicate` takes explicit input and output FASTQ paths.
-
-### 1. Build the reference
+### 1. Build the sample reference
 
 ```bash
-ribotxalign create-reference \
+python RiboTxAlign_Cmd.py create-reference \
   --config RiboTxAlign_human.yaml \
-  --sample-name SRR26942051 \
-  --output-dir /path/to/RiboTxAlign_output \
+  --sample-name sample1 \
+  --output-dir results \
   --stringtie-gtf /path/to/stringtie.transcripts.gtf
 ```
 
-Standard outputs:
+This creates `results/sample1/reference/sample1.{fa,gtf,coordinates.tsv,metadata.tsv}`. Use the same sample name and output directory in the mapping command.
 
-```text
-<output_dir>/<sample_name>/reference/<sample_name>.fa
-<output_dir>/<sample_name>/reference/<sample_name>.gtf
-<output_dir>/<sample_name>/reference/<sample_name>.coordinates.tsv
-<output_dir>/<sample_name>/reference/<sample_name>.metadata.tsv
-```
-
-### 2. Deduplicate reads
+### 2. Optional mapping-free UMI deduplication
 
 ```bash
-ribotxalign deduplicate \
-  --fastq /path/to/reads.fastq.gz \
-  --output-fastq /path/to/RiboTxAlign_output/SRR26942051/reads/SRR26942051.deduplicated.fastq.gz
+python RiboTxAlign_Cmd.py deduplicate \
+  --fastq /path/to/sample1.clean.fastq.gz \
+  --output-fastq results/sample1/reads/sample1.deduplicated.fastq.gz
 ```
 
-Outputs for the chosen `--output-fastq` path:
+This command accepts only `--fastq` and `--output-fastq`; it does not take a YAML file or sample name. Statistics are written to `<output-fastq>.stats.tsv`, for example `sample1.deduplicated.fastq.gz.stats.tsv`. Temporary UMI buckets are removed after successful processing.
 
-```text
-<output_dir>/<sample_name>/reads/<sample_name>.deduplicated.fastq.gz
-<output_dir>/<sample_name>/reads/<sample_name>.deduplicated.fastq.gz.stats.tsv
-```
+UMIs must already be extracted into the read identifiers, for example `read0001_ACGTACGTA`. The terminal run of uppercase A/C/G/T bases is interpreted as the UMI. UMI lengths must be consistent and at least five bases. The current implementation supports sequences up to 40 nt and uses encoded sequence blocks to compare equal-length sequences within a UMI, allowing up to three substitutions. This is sequence/UMI-based preprocessing before alignment, not genomic-coordinate deduplication. Mapping counts the retained representative records without expansion by family size.
 
-The `run` command always uses the FASTQ supplied with `--fastq` directly.
-Pass the deduplicated output when using UMI deduplication, or the original
-FASTQ when skipping it. There is no `pipeline.use_deduplicated_fastq` setting.
+### 3. Map and allocate reads
 
-### 3. Run steps c through l
+If deduplication was performed:
 
 ```bash
-ribotxalign run \
+python RiboTxAlign_Cmd.py run \
   --config RiboTxAlign_human.yaml \
-  --sample-name SRR26942051 \
-  --output-dir /path/to/RiboTxAlign_output \
-  --fastq /path/to/RiboTxAlign_output/SRR26942051/reads/SRR26942051.deduplicated.fastq.gz
+  --sample-name sample1 \
+  --output-dir results \
+  --fastq results/sample1/reads/sample1.deduplicated.fastq.gz
 ```
 
-The command uses the standard reference paths created by `create-reference`.
-The same `--sample-name` and `--output-dir` must therefore be used.
+Otherwise pass the cleaned original FASTQ to `--fastq`. `run` neither builds the reference nor performs deduplication automatically.
 
-## Standard output layout
+## Workflow and parallel execution
 
-With `pipeline.delete_intermediate_files: true`, temporary mapping shards, group-EM input files, FASTQ-order assignment parts, the temporary final assignment Parquet, and unsorted BAM files are removed only after genome rescue, BAM merge, coordinate sorting, indexing, and read-count validation have completed successfully.
+1. Construct a sample-specific reference, supplementing compatible transcript structures and CDS annotation with GENCODE. Consolidate eligible CDS-equivalent models and assign groups connected by same-strand exon overlap.
+2. Align footprints to the spliced reference. Among highest-score ties, retain CDS-overlapping candidates preferentially. A transcript's own CDS takes precedence over the group-derived fallback. Unique non-CDS hits and all-non-CDS candidate sets remain eligible.
+3. Run group EM (EM1), followed by transcript EM (EM2) with fixed group weights. Before EM2, candidates without candidate-specific reads are merged only when their non-empty ambiguous read sets are identical. Lack of specific reads alone does not establish absence of translation.
+4. Generate fractional estimates and weighted depth/P-site profiles. Project transcript alignments to genomic coordinates and allocate discrete placements for BAM output.
+5. Rescue eligible transcript-unmapped reads by contiguous genome mapping, then conservative splice-aware mapping. Combine accepted rescued and transcript-supported placements, sort, index, and validate the BAM.
+
+Stage labels `c` through `l` identify processing steps, **not a strictly serial execution order**:
 
 ```text
-<output_dir>/<sample_name>/
+c: transcript mapping
+├─ k: genome rescue (child process)
+└─ d: sort mapping records → e: prepare group input → f: EM1 → g: EM2
+                                                            ├─ h: depth/profiles (child process)
+                                                            └─ i: genomic allocation → j: BAM writing
+j + k → l: merge / sort / index / validate BAM
+h + l → cleanup and successful completion
+```
+
+Rescue overlaps downstream EM processing, and depth generation overlaps genomic allocation/BAM writing. Account for concurrent branches when choosing worker counts and memory limits. A child-process failure fails the workflow and terminates the other active child branch.
+
+Rescued reads contribute to the final BAM, not transcript TPM or posterior-weighted transcript profiles. Reads excluded as decoy-derived are not eligible for rescue.
+
+## Outputs
+
+```text
+results/sample1/
 ├── reference/
-│   ├── <sample_name>.fa
-│   ├── <sample_name>.gtf
-│   ├── <sample_name>.coordinates.tsv
-│   └── <sample_name>.metadata.tsv
-├── reads/
-│   ├── <sample_name>.deduplicated.fastq.gz
-│   ├── <sample_name>.unmapped.fastq.gz
-│   └── <sample_name>.deduplicated.fastq.gz.stats.tsv
+│   ├── sample1.fa
+│   ├── sample1.gtf
+│   ├── sample1.coordinates.tsv
+│   └── sample1.metadata.tsv
+├── reads/                         # Optional deduplication output location chosen above
+│   ├── sample1.deduplicated.fastq.gz
+│   └── sample1.deduplicated.fastq.gz.stats.tsv
 ├── mapping/
-│   ├── <sample_name>.mapping.log
-│   └── <sample_name>.mapping_stats.json
+│   ├── sample1.mapping.log
+│   ├── sample1.mapping_stats.json
+│   ├── sample1.unmapped.fastq.gz
+│   └── sample1.genome_rescue_stats.json
 ├── em/
-│   ├── <sample_name>.group_tpm.tsv
-│   ├── <sample_name>.group_em.log
-│   ├── <sample_name>.transcript_tpm.tsv
-│   ├── <sample_name>.transcript_merge.tsv
-│   └── <sample_name>.reads_info.parquet
-├── depth/
-│   └── <sample_name>.*
-└── bam/
-    ├── <sample_name>.final_assignments.stats.tsv
-    ├── <sample_name>.genome.sorted.bam
-    └── <sample_name>.genome.sorted.bam.bai
+│   ├── sample1.group_tpm.tsv
+│   ├── sample1.group_em.log
+│   ├── sample1.transcript_tpm.tsv
+│   ├── sample1.transcript_em.log
+│   ├── sample1.transcript_merge.tsv
+│   └── sample1.reads_info.parquet
+├── depth/                         # Coverage, P-site profiles and configured tracks
+├── bam/
+│   ├── sample1.final_assignments.stats.tsv
+│   ├── sample1.genome.sorted.bam
+│   └── sample1.genome.sorted.bam.bai
+└── logs/child_processes/           # Child-process error reports, when a stage fails
 ```
 
-The retained `<sample_name>.reads_info.parquet` is a primary output rather
-than a temporary file. It contains the final read-level transcript information:
+The transcript-unmapped FASTQ is the input to rescue, not a FASTQ of reads remaining unmapped after rescue. Final mapping and rescue counts are recorded in the JSON summaries.
 
-```text
-group_id
-transcript_id
-alignment_transcript_id
-read_id
-start
-end
-read_length
-hit_index
-query_start
-query_end
-mapping_strand
-cigar
-prior_probability
-transcript_probability
-other_transcript_ids
-```
+`reads_info.parquet` retains read-level probabilities and original alignment coordinates. `transcript_id` identifies the EM representative; `alignment_transcript_id` identifies the reference used for the original alignment and genomic projection. Merged source IDs should not be interpreted as independently quantified isoforms.
 
-Set the following only when intermediate files are required for debugging or
-resuming individual internal stages:
+The final BAM contains discrete placements. Its `XA` assignment tags distinguish transcript-supported and rescued classes, including `genome_rescued_unique` and `genome_splice_rescued_unique`. These assignment categories are not directly interchangeable with another mapper's definition of sequence uniqueness.
 
-```yaml
-pipeline:
-  delete_intermediate_files: false
-```
+## Logs, runtime, and memory
 
-
-
-`transcript_id` is the representative transcript used by transcript-level EM.
-`alignment_transcript_id` is the original transcript reference against which
-the read coordinates and CIGAR were produced. Genome projection always uses
-`alignment_transcript_id`, so transcript merging cannot invalidate the stored
-alignment coordinates.
-
-The original transcript-alignment CIGAR is retained through transcript EM.
-During genome assignment, exon-junction `N` operations are inserted without
-discarding `I`, `D`, `S`, `=`, or `X` operations. For minus-strand
-transcripts, the genomic CIGAR operation order is reversed. The BAM writer
-reverse-complements the sequence and reverses quality scores when the final
-genomic alignment strand is reverse.
-
-## Unmapped-read genome rescue
-
-During transcript-reference mapping, reads with no accepted transcript alignment are written to:
-
-```text
-<output_dir>/<sample_name>/reads/<sample_name>.unmapped.fastq.gz
-```
-
-Reads removed as decoy-derived are not included. Step `k` loads two mappy
-aligners, each with `n_threads=1`, and processes every read in two stages:
-
-1. contiguous genome rescue using the short-read preset;
-2. splice rescue only when contiguous rescue fails.
-
-The splice rescue is deliberately conservative. An alignment is retained only
-when it has one uniquely best score, exactly one intron, at least the configured
-anchor length on both sides, an intron within the configured length range, and
-an allowed canonical splice motif. The default settings are:
-
-```text
-minimum anchor length: 11 nt
-minimum intron length: 20 nt
-maximum intron length: 2000 nt
-canonical motifs: GT-AG, GC-AG, AT-AC
-```
-
-The two rescued classes are written to the same unsorted rescue BAM and are
-distinguished by the `XA` tag:
-
-```text
-XA:Z:genome_rescued_unique
-XA:Z:genome_splice_rescued_unique
-```
-
-Reads that remain unresolved after both stages are counted in the mapping statistics but are not written to another FASTQ file.
-
-The machine-readable mapping summary is updated throughout the workflow:
-
-```text
-<output_dir>/<sample_name>/mapping/<sample_name>.mapping_stats.json
-```
-
-It separately records contiguous and splice-rescued counts, their sum, final
-mapped/unique/multi/unmapped counts, and final BAM validation results. Rescue
-parameters are configured in the YAML `rescue` section.
-
-## Multi-mapping assignment
-
-Transcript candidates that produce the same genome alignment are collapsed before BAM output. Genome-unique alignments are fixed directly. Remaining multi-mapping reads are assigned at transcript-group level.
-
-The assignment objective minimizes the change in relative squared error between assigned read counts and posterior-derived group expectations. It therefore preserves the group TPM pattern rather than minimizing absolute count deficits, which would otherwise favor highly expressed groups.
-
-## Mapping and group EM memory settings
-
-Stage c caches reference-name parsing and decoy/ALT classification in bounded
-per-process caches (up to 65,536 entries per cache). Alignment scores and
-read-dependent filtering are still evaluated for every read. CDS intervals
-continue to be loaded once per worker.
-
-`mapping.parquet_row_group_size` (default 100,000) also caps the total Python
-rows buffered by each mapping writer across all chromosomes. Rows are stored
-as columns and flushed incrementally. The input FASTQ chunk, mappy index,
-reference caches, and open Parquet writers use additional memory. The part
-filenames, schema, hit order, and per-chromosome row order are unchanged.
-
-Stage f defaults to compact integer candidate arrays and float64 NumPy EM:
-
-```yaml
-group_em:
-  engine: numpy
-  keep_iteration_history: false
-```
-
-Zero-TPM candidate sets retain equal allocation. By default only iteration
-zero and the latest iteration are kept; the output TSV still contains initial
-and final TPM, expected counts, and multi-hit record counts. Python API
-callers using `run_group_em` should read `GroupEmInfo.multi_hit_record_count`
-with the NumPy engine: individual `multi_hit_records` are not retained.
-Set `keep_iteration_history: true` to retain every iteration. Set
-`engine: python` to use the original arithmetic and per-read objects for
-comparison. NumPy reductions may introduce small floating-point differences;
-bit-for-bit identity is not guaranteed.
-
-The synthetic comparison can be repeated against a saved pre-change tree:
+Save both standard output and standard error to preserve workflow messages. On Linux, GNU `time` can additionally record elapsed time and maximum resident set size:
 
 ```bash
-python test/benchmark_mapping_em_optimization.py \
-  --baseline-dir /path/to/pre-change-source \
-  --output-dir /path/to/new-benchmark-directory
+mkdir -p results/sample1/resource
+/usr/bin/time -v -o results/sample1/resource/run.resource_usage.txt \
+  python RiboTxAlign_Cmd.py run \
+    --config RiboTxAlign_human.yaml \
+    --sample-name sample1 \
+    --output-dir results \
+    --fastq results/sample1/reads/sample1.deduplicated.fastq.gz \
+  > results/sample1/resource/run.log 2>&1
 ```
 
-Use a new output directory. This benchmark checks output equivalence and
-measures c's Python postprocessing/Parquet output (excluding mappy), plus f's
-loading, iterations, and output. It is not an end-to-end sample benchmark.
+This measures `run`; reference construction and deduplication require separate measurements. The maximum RSS reported by GNU `time` is not a sampled sum of the simultaneous RSS of every worker. Retain the raw measurement and command when comparing resource use. Group and transcript EM logs provide their own processing details and timings.
 
-## Restarting after a mapping failure
+## Rerunning and intermediate files
 
-Mapping starts from the first FASTQ read on every `run`. Existing
-`mapping/parts/*.part*.parquet` files from an earlier attempt are deleted
-before workers start by default, so old and new results cannot be mixed.
-The default setting is:
+`run` restarts mapping from the beginning; it does not resume a checkpoint. With `mapping.overwrite: true`, old mapping shards are removed before remapping. `sorting.overwrite` and `group_input.overwrite` similarly control their dedicated intermediate outputs. Setting these to `false` makes existing outputs an error.
 
-```yaml
-mapping:
-  overwrite: true
-```
+Use a fresh output directory for a new reference, changed settings, or benchmark run. Never run concurrent jobs with the same output directory and sample name.
 
-Set `mapping.overwrite: false` to stop with an error if parts already exist.
-The default removes all old mapping part files before remapping, including parts
-that the new run may not produce. Other files in the parts directory are
-preserved. The unmapped FASTQ and mapping statistics are regenerated by
-the run. This is a full restart, not checkpoint resume. Never run two jobs
-with the same sample name and output directory concurrently.
+With `pipeline.delete_intermediate_files: true`, temporary mapping, EM-input, assignment, and unsorted BAM files are removed after both output branches complete successfully. Keep it `false` when intermediate files are needed for diagnostics. Final read-level probabilities, abundance tables, statistics, and final BAM outputs are retained.
 
-## BAM output
+## Validation and paper data
 
-The final assignment table is ordered according to the FASTQ read order and divided into contiguous Parquet parts. The FASTQ is then streamed once while the corresponding Parquet part is exchanged at each boundary.
+Validation scripts are separate from the mapping pipeline. Their dataset paths may need editing for your environment.
 
-Step `j` writes an unsorted BAM containing transcript-supported genome alignments. Step `k` first performs contiguous genome rescue and then applies conservative splice rescue only to unresolved reads. Rescued records are marked with one of:
+- [BAM comparison](test/validation/README.md)
+- [Mapping-count summaries](test/validation/README_counts.md)
+- [Collecting paper results and resource logs](test/validation/README_collect_paper_results.md)
+- [Simulation TPM plots](test/similation/README_plot_tpm.md)
+- [Exon-level validation](test/similation/README_exon_validation.md)
 
-```text
-XA:Z:genome_rescued_unique
-XA:Z:genome_splice_rescued_unique
-NH:i:1
-```
-
-Step `l` merges the transcript-supported and rescued BAMs, coordinate-sorts and indexes the merged BAM, and verifies that BAM read counts agree with `<sample_name>.mapping_stats.json`. The final BAM contains all retained alignments; the `XA` tag distinguishes original genome-unique, multi-map-assigned, contiguous-rescued, and splice-rescued reads.
+The simulation directory is named `test/similation` in this repository.
 
 ## Command help
 
 ```bash
-ribotxalign create-reference --help
-ribotxalign deduplicate --help
-ribotxalign run --help
+python RiboTxAlign_Cmd.py create-reference --help
+python RiboTxAlign_Cmd.py deduplicate --help
+python RiboTxAlign_Cmd.py run --help
 ```
