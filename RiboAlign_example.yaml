@@ -1,0 +1,92 @@
+# RiboTxAlign 1.0 example configuration, based on the mouse configuration.
+# Replace reference paths with your own matching genome and annotation files.
+# Supply the assembled StringTie GTF with --stringtie-gtf, not in this YAML.
+
+reference:
+  gencode_gff3: /path/to/gencode.annotation.gff3
+  genome_fasta: /path/to/genome.fa
+  # Optional. Defaults to <genome_fasta>.fai when omitted.
+  genome_fai: /path/to/genome.fa.fai
+
+pipeline:
+  # Remove temporary mapping, EM-input, and BAM-partition files after success.
+  delete_intermediate_files: true
+
+mapping:
+  # Discard old mapping parts and restart; set false to stop if parts exist.
+  overwrite: true
+  maximum_reads: null
+  maximum_candidates: 16
+  kmer_size: 11
+  window_size: 2
+  minimum_minimizers: 1
+  minimum_chain_score: 10
+  minimum_dp_score: 10
+  minimum_query_coverage: 0.85
+  minimum_identity: 0.90
+  worker_count: 6
+  reads_per_worker: 500000
+  progress_interval: 100000
+  parquet_row_group_size: 100000
+  exclude_decoy_reads: true
+  decoy_reference_patterns: "chrUn_*,*_random,DECOY_*"
+  start_method: spawn
+
+rescue:
+  contiguous_preset: sr
+  splice_preset: splice
+  kmer_size: 11
+  window_size: 3
+  minimum_minimizers: 1
+  minimum_chain_score: 10
+  minimum_dp_score: 10
+  minimum_query_coverage: 0.85
+  minimum_identity: 0.90
+  progress_interval: 100000
+
+sorting:
+  read_batch_size: 100000
+  row_group_size: 100000
+  worker_count: 4
+  overwrite: true
+  delete_intermediate_parquets: true
+  start_method: spawn
+
+group_input:
+  batch_size: 100000
+  write_batch_size: 100000
+  worker_count: 4
+  overwrite: true
+  minimum_mapped_reads: 10
+  minimum_mapped_span: 100
+  minimum_transcript_fraction: 0.3333333333
+
+group_em:
+  trial_count: 300
+  convergence_threshold: 60.0
+  read_length: 32
+  batch_size: 100000
+
+depth:
+  profile_minimum: -40
+  profile_maximum: 20
+  minimum_offset: 8
+  maximum_offset: 20
+  fallback_offset: 12
+  minimum_profile_weight: 10.0
+  metagene_minimum: -50
+  metagene_maximum: 100
+  batch_size: 100000
+  create_bigwig: true
+  create_genome_bigwig: true
+
+assignment:
+  batch_size: 250000
+  local_bin_size: 30
+
+bam:
+  partition_count: 10
+  batch_size: 250000
+  compression: zstd
+  sort_threads: 8
+  sort_memory: 2G
