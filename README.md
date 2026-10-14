@@ -167,18 +167,6 @@ Use a fresh output directory for a new reference, changed settings, or benchmark
 
 With `pipeline.delete_intermediate_files: true`, temporary mapping, EM-input, assignment, and unsorted BAM files are removed after both output branches complete successfully. Keep it `false` when intermediate files are needed for diagnostics. Final read-level probabilities, abundance tables, statistics, and final BAM outputs are retained.
 
-## Validation and paper data
-
-Validation scripts are separate from the mapping pipeline. Their dataset paths may need editing for your environment.
-
-- [BAM comparison](test/validation/README.md)
-- [Mapping-count summaries](test/validation/README_counts.md)
-- [Collecting paper results and resource logs](test/validation/README_collect_paper_results.md)
-- [Simulation TPM plots](test/similation/README_plot_tpm.md)
-- [Exon-level validation](test/similation/README_exon_validation.md)
-
-The simulation directory is named `test/similation` in this repository.
-
 ## Command help
 
 ```bash
