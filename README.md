@@ -159,23 +159,6 @@ The transcript-unmapped FASTQ is the input to rescue, not a FASTQ of reads remai
 
 The final BAM contains discrete placements. Its `XA` assignment tags distinguish transcript-supported and rescued classes, including `genome_rescued_unique` and `genome_splice_rescued_unique`. These assignment categories are not directly interchangeable with another mapper's definition of sequence uniqueness.
 
-## Logs, runtime, and memory
-
-Save both standard output and standard error to preserve workflow messages. On Linux, GNU `time` can additionally record elapsed time and maximum resident set size:
-
-```bash
-mkdir -p results/sample1/resource
-/usr/bin/time -v -o results/sample1/resource/run.resource_usage.txt \
-  python RiboTxAlign_Cmd.py run \
-    --config RiboTxAlign_human.yaml \
-    --sample-name sample1 \
-    --output-dir results \
-    --fastq results/sample1/reads/sample1.deduplicated.fastq.gz \
-  > results/sample1/resource/run.log 2>&1
-```
-
-This measures `run`; reference construction and deduplication require separate measurements. The maximum RSS reported by GNU `time` is not a sampled sum of the simultaneous RSS of every worker. Retain the raw measurement and command when comparing resource use. Group and transcript EM logs provide their own processing details and timings.
-
 ## Rerunning and intermediate files
 
 `run` restarts mapping from the beginning; it does not resume a checkpoint. With `mapping.overwrite: true`, old mapping shards are removed before remapping. `sorting.overwrite` and `group_input.overwrite` similarly control their dedicated intermediate outputs. Setting these to `false` makes existing outputs an error.
