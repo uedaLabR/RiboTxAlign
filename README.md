@@ -1,5 +1,7 @@
 # RiboTxAlign
 
+Version: **1.0**. Check the installed source version with `python RiboTxAlign_Cmd.py --version`.
+
 RiboTxAlign maps short, single-end ribosome profiling (Ribo-seq) reads to a sample-specific spliced transcript reference built from StringTie assemblies and GENCODE annotation. Two sequential expectation-maximization (EM) stages estimate support between transcript groups and within each group. The workflow produces fractional abundance estimates, posterior-weighted profiles, and a genome-coordinate BAM, including eligible reads recovered by genome rescue.
 
 RNA-seq assembly is performed upstream. Either short-read- or long-read-derived StringTie models can be supplied. Estimated transcript support is not, by itself, proof that an individual isoform is actively translated.
@@ -29,7 +31,7 @@ python -m pip install pyBigWig matplotlib
 python RiboTxAlign_Cmd.py --help
 ```
 
-The examples below run from the repository root. The current packaging metadata does not include all workflow modules and dependencies, so use the source-checkout commands rather than relying on a standalone wheel installation. The CLI and package metadata also currently report different version strings; record the source commit for reproducible analyses.
+The examples below run from the repository root. The current packaging metadata does not include all workflow modules and dependencies, so use the source-checkout commands rather than relying on a standalone wheel installation. Record the version and source commit for reproducible analyses.
 
 ## Inputs and configuration
 
@@ -56,6 +58,48 @@ pipeline:
 `genome_fai` defaults to `<genome_fasta>.fai`. YAML paths are resolved relative to the YAML file; command-line paths are resolved relative to the current directory. Sample name, output directory, FASTQ, and StringTie GTF are supplied on the command line.
 
 **`run` always reads the file supplied by `--fastq`.** The legacy `pipeline.use_deduplicated_fastq` setting present in the example YAML files is not used by the current pipeline. Deduplication must be run separately, and its output passed explicitly to `run`.
+
+### Editing the YAML file
+
+Start with the supplied human or mouse configuration and change the three `reference` paths to your own files. Use a matching genome assembly and annotation (for example, hg38 with its corresponding human annotation). Keep the remaining analysis settings initially; the supplied settings differ from some internal defaults, so copying the full example preserves the intended configuration.
+
+```bash
+cp RiboTxAlign_human.yaml my_config.yaml
+# Edit my_config.yaml, then supply --config my_config.yaml to the commands below.
+```
+
+Use spaces for indentation, `true`/`false` for boolean values, and `null` for an unset limit. The main settings are:
+
+| Section / setting | Meaning and how to change it |
+|---|---|
+| `reference.gencode_gff3` | Path to the GENCODE GFF3 annotation. |
+| `reference.genome_fasta` | Path to the matching genome FASTA. |
+| `reference.genome_fai` | FASTA index path; may be omitted when it is `<genome_fasta>.fai`. |
+| `pipeline.delete_intermediate_files` | `true` removes intermediate files after successful completion; `false` keeps them. |
+| `mapping.worker_count` | Number of transcript-mapping workers. Reduce it when memory is limited. |
+| `sorting.worker_count`, `group_input.worker_count` | Worker counts for sorting and group-input preparation, respectively. |
+| `mapping.reads_per_worker` | Reads per mapping task; smaller batches reduce the amount handled per task. |
+| `mapping.maximum_reads` | `null` processes all reads; an integer limits input for a trial run. |
+| `mapping.maximum_candidates` | Maximum retained transcript candidates per read (example: `16`). |
+| `mapping.minimum_query_coverage` | Minimum aligned fraction of the read (`0.85` means 85%). |
+| `mapping.minimum_identity` | Minimum matching-base fraction of the alignment block (`0.90` means 90%). |
+| `mapping.kmer_size`, `mapping.window_size` | Alignment seed settings. Human and mouse examples use different windows; changing these can change mapping results. |
+| `mapping.exclude_decoy_reads`, `mapping.decoy_reference_patterns` | Whether and which decoy-reference matches exclude a read. Patterns must match your reference names. |
+| `mapping.prefer_primary_on_alt_tie` | Optional preference for canonical candidates over equal-score ALT candidates under the implemented eligibility conditions. |
+| `mapping.overwrite`, `sorting.overwrite`, `group_input.overwrite` | Allow replacement of the corresponding intermediate outputs; these do not enable checkpoint resume. |
+| `group_em.read_length` | Representative footprint length in nucleotides, used in group effective-length calculation (`32` in the examples); this is not a FASTQ length filter. |
+| `group_em.trial_count` | Maximum number of EM1 iterations (`300` in the examples). |
+| `group_em.convergence_threshold` | EM1 stopping threshold; keep the supplied value unless deliberately changing the inference settings. |
+| `rescue.enable_splice_rescue` | Enable conservative splice rescue after contiguous rescue fails; defaults to `true`. |
+| `rescue.minimum_query_coverage`, `rescue.minimum_identity` | Acceptance thresholds for genome rescue. |
+| `depth.create_bigwig`, `depth.create_genome_bigwig` | Enable transcript-coordinate and genome-coordinate BigWig output, respectively. |
+| `depth.minimum_offset`, `depth.maximum_offset`, `depth.fallback_offset` | P-site offset search limits and fallback offset, in nucleotides. |
+| `bam.sort_threads` | Threads used for final BAM sorting. |
+| `bam.sort_memory` | BAM sorting memory limit per thread, for example `2G`; it is not a whole-pipeline memory limit. |
+
+The `batch_size` settings control processing batches in their respective stages. EM2 settings are currently supplied by the implementation rather than a separate YAML section. The `stringtie` section is used by the separate `run_stringtie_ribotxalign.py` helper; `create-reference` takes an already assembled GTF and does not run StringTie.
+
+Two legacy settings in the example files need attention: `pipeline.use_deduplicated_fastq` is ignored (pass the desired FASTQ explicitly), and the current rescue preset keys are `rescue.contiguous_preset` and `rescue.splice_preset`, not `rescue.preset`. Their defaults are `sr` and `splice`, respectively.
 
 ## Quick start
 
