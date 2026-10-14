@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from fnmatch import fnmatch
+from functools import lru_cache
 from concurrent.futures import (
     ProcessPoolExecutor,
 )
@@ -93,6 +94,7 @@ def _parse_decoy_reference_patterns(
     )
 
 
+@lru_cache(maxsize=65_536)
 def _is_decoy_reference(
     reference_name: str,
     decoy_reference_patterns: tuple[str, ...],
@@ -267,16 +269,19 @@ def map_and_write_chunk(
             counters.mapped_reads += 1
             mapped_read_count += 1
 
-            writer.add_read(
+            group_count = writer.add_read(
                 read_id=read.read_id,
                 read_length=len(read.sequence),
                 alignments=alignments,
             )
 
-            if _count_candidate_groups(alignments) == 1:
+            if group_count == 1:
                 counters.group_unique_reads += 1
             else:
                 counters.group_multi_reads += 1
+    except BaseException:
+        writer.abort()
+        raise
     finally:
         if unmapped_handle is not None:
             unmapped_handle.close()

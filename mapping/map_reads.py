@@ -138,92 +138,88 @@ def run_transcript_mapping_to_parquet(
             ),
         )
 
-        for read in batch:
-            counters.total_reads += 1
+        with batch_writer:
+            for read in batch:
+                counters.total_reads += 1
 
-            alignments, limit_reached = (
-                mapper.map_read(
+                alignments, limit_reached = (
+                    mapper.map_read(
+                        read_id=read.read_id,
+                        sequence=read.sequence,
+                    )
+                )
+
+                if limit_reached:
+                    counters.best_hit_overflow_reads += 1
+
+                if not alignments:
+                    counters.unmapped_reads += 1
+                    continue
+
+                alignments, removed_alt_hits = prefer_primary_alt_ties(
+                    alignments, enabled=prefer_primary_on_alt_tie, limit_reached=limit_reached,
+                )
+                counters.primary_preferred_alt_tie_reads += int(removed_alt_hits > 0)
+                counters.removed_alt_tie_hits += removed_alt_hits
+                counters.mapped_reads += 1
+
+                group_count = batch_writer.add_read(
                     read_id=read.read_id,
-                    sequence=read.sequence,
-                )
-            )
-
-            if limit_reached:
-                counters.best_hit_overflow_reads += 1
-
-            if not alignments:
-                counters.unmapped_reads += 1
-                continue
-
-            alignments, removed_alt_hits = prefer_primary_alt_ties(
-                alignments, enabled=prefer_primary_on_alt_tie, limit_reached=limit_reached,
-            )
-            counters.primary_preferred_alt_tie_reads += int(removed_alt_hits > 0)
-            counters.removed_alt_tie_hits += removed_alt_hits
-            counters.mapped_reads += 1
-
-            batch_writer.add_read(
-                read_id=read.read_id,
-                read_length=len(
-                    read.sequence
-                ),
-                alignments=alignments,
-            )
-
-            if (
-                _count_candidate_groups(
-                    alignments
-                )
-                == 1
-            ):
-                counters.group_unique_reads += 1
-            else:
-                counters.group_multi_reads += 1
-
-            if (
-                progress_interval > 0
-                and counters.total_reads
-                >= next_progress
-            ):
-                elapsed = (
-                    time.time()
-                    - start_time
-                )
-                speed = (
-                    counters.total_reads
-                    / elapsed
-                    if elapsed > 0
-                    else 0.0
+                    read_length=len(
+                        read.sequence
+                    ),
+                    alignments=alignments,
                 )
 
-                logger.info(
-                    "Processed=%d "
-                    "Speed=%.1f reads/s "
-                    "Mapped=%d "
-                    "GroupUnique=%d "
-                    "GroupMulti=%d "
-                    "Unmapped=%d "
-                    "BestHitLimitReached=%d",
-                    counters.total_reads,
-                    speed,
-                    counters.mapped_reads,
-                    counters.group_unique_reads,
-                    counters.group_multi_reads,
-                    counters.unmapped_reads,
-                    counters.best_hit_overflow_reads,
-                )
+                if group_count == 1:
+                    counters.group_unique_reads += 1
+                else:
+                    counters.group_multi_reads += 1
 
-                while (
-                    next_progress
-                    <= counters.total_reads
+                if (
+                    progress_interval > 0
+                    and counters.total_reads
+                    >= next_progress
                 ):
-                    next_progress += (
-                        progress_interval
+                    elapsed = (
+                        time.time()
+                        - start_time
+                    )
+                    speed = (
+                        counters.total_reads
+                        / elapsed
+                        if elapsed > 0
+                        else 0.0
                     )
 
-        output_files = (
-            batch_writer.write_and_close()
-        )
+                    logger.info(
+                        "Processed=%d "
+                        "Speed=%.1f reads/s "
+                        "Mapped=%d "
+                        "GroupUnique=%d "
+                        "GroupMulti=%d "
+                        "Unmapped=%d "
+                        "BestHitLimitReached=%d",
+                        counters.total_reads,
+                        speed,
+                        counters.mapped_reads,
+                        counters.group_unique_reads,
+                        counters.group_multi_reads,
+                        counters.unmapped_reads,
+                        counters.best_hit_overflow_reads,
+                    )
+
+                    while (
+                        next_progress
+                        <= counters.total_reads
+                    ):
+                        next_progress += (
+                            progress_interval
+                        )
+
+            output_files = (
+                batch_writer.write_and_close()
+            )
 
         logger.info(
             "Batch=%d InputReads=%d PartFiles=%d",

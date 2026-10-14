@@ -4,6 +4,7 @@ from pathlib import Path
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from parquet_work.buffered_writer import BufferedParquetWriter
 
 
 def load_group_tpm(
@@ -142,13 +143,9 @@ def process_single_transcript_group(
         )
 
 
-def write_reads_info(
-    reads_info,
-    output_parquet,
-):
-    """Write read assignment information to Parquet."""
-
-    schema = pa.schema(
+def reads_info_schema():
+    """Schema shared by streaming EM output and standalone writes."""
+    return pa.schema(
         [
             ("group_id", pa.string()),
             ("transcript_id", pa.string()),
@@ -182,33 +179,20 @@ def write_reads_info(
         ]
     )
 
-    normalized_rows = []
-
-    for row in reads_info:
-
-        normalized_row = dict(
-            row
-        )
-
-        normalized_row.setdefault(
-            "other_transcript_ids",
-            [],
-        )
-
-        normalized_rows.append(
-            normalized_row
-        )
-
-    table = pa.Table.from_pylist(
-        normalized_rows,
-        schema=schema,
-    )
-
-    pq.write_table(
-        table,
+def open_reads_info_writer(output_parquet, batch_size=100_000):
+    return BufferedParquetWriter(
         output_parquet,
-        compression="zstd",
+        reads_info_schema(),
+        batch_size=batch_size,
+        defaults={"other_transcript_ids": []},
     )
+
+
+def write_reads_info(reads_info, output_parquet, batch_size=100_000):
+    """Write rows without making a second full-sample Python list."""
+    with open_reads_info_writer(output_parquet, batch_size) as writer:
+        for row in reads_info:
+            writer.append(row)
 
 
 # ------------------------------------------------------------

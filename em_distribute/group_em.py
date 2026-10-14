@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pyarrow.parquet as pq
+
+from em_distribute.group_em_numpy import NumpyMultiHits
 
 
 @dataclass(slots=True)
@@ -35,6 +38,9 @@ class GroupEmInfo:
     expected_count_by_iteration: list[float] = field(
         default_factory=list
     )
+
+    # The NumPy backend stores candidate rows compactly, outside this object.
+    multi_hit_record_count: int | None = None
 
     def effective_length(
         self,
@@ -518,16 +524,35 @@ def run_em_iteration(
             group.unique_read_count
         )
 
-        for record in group.multi_hit_records:
-            expected_count += (
-                calculate_multi_hit_contribution(
+        # Avoid cache overhead when the first records have no repeated pattern.
+        # This only selects a computation path; every read is still included.
+        sample = group.multi_hit_records[:64]
+        if len({record.other_group_ids for record in sample}) == len(sample):
+            for record in group.multi_hit_records:
+                expected_count += calculate_multi_hit_contribution(
                     group_id=group_id,
                     record=record,
-                    current_tpm_by_group=(
-                        current_tpm_by_group
-                    ),
+                    current_tpm_by_group=current_tpm_by_group,
                 )
-            )
+        else:
+            # Candidate order is part of the key: preserve floating-point sums
+            # within each posterior AND across reads. TPM changes at every
+            # M-step, so cache only within this group/iteration.
+            contributions = {}
+            for record in group.multi_hit_records:
+                candidates = record.other_group_ids
+                contribution = contributions.get(candidates)
+                if contribution is None:
+                    contribution = calculate_multi_hit_contribution(
+                        group_id=group_id,
+                        record=record,
+                        current_tpm_by_group=current_tpm_by_group,
+                    )
+                    # Bound memory for unusually diverse candidate sets.
+                    if len(contributions) >= 4096:
+                        contributions.clear()
+                    contributions[candidates] = contribution
+                expected_count += contribution
 
         expected_count_by_group[
             group_id
@@ -571,10 +596,14 @@ def append_iteration_results(
         float,
     ],
     tpm_by_group: dict[str, float],
+    keep_iteration_history: bool = True,
 ) -> None:
-    """Store one iteration in every group object."""
+    """Store all iterations, or only iteration zero and the latest result."""
 
     for group_id, group in groups.items():
+        if not keep_iteration_history:
+            del group.expected_count_by_iteration[1:]
+            del group.tpm_by_iteration[1:]
         group.expected_count_by_iteration.append(
             expected_count_by_group[
                 group_id
@@ -588,17 +617,19 @@ def append_iteration_results(
         )
 
 
-def load_data(
+def _load_em_data(
     em_input_directory: str | Path,
     mapping_log_path: str | Path,
     read_length: int,
     batch_size: int,
     logger: logging.Logger,
+    engine: str,
 ) -> tuple[
     dict[str, GroupEmInfo],
     dict[str, float],
     int,
     int,
+    NumpyMultiHits | None,
 ]:
     """
     Load EM input and create the iteration-0 TPM dictionary.
@@ -624,15 +655,19 @@ def load_data(
         batch_size=batch_size,
     )
 
-    multi_record_count = (
-        load_multi_hit_records(
+    numpy_data = None
+    if engine == "numpy":
+        numpy_data = NumpyMultiHits.from_parquet(groups, multi_read_paths, batch_size)
+        multi_record_count = numpy_data.record_count
+        logger.info("Compact multi-hit arrays: %d bytes", numpy_data.nbytes)
+    else:
+        multi_record_count = load_multi_hit_records(
             groups=groups,
             multi_read_paths=(
                 multi_read_paths
             ),
             batch_size=batch_size,
         )
-    )
 
     initial_tpm_by_group = (
         initialize_iteration_zero(
@@ -665,7 +700,14 @@ def load_data(
         initial_tpm_by_group,
         mapped_read_count,
         multi_record_count,
+        numpy_data,
     )
+
+
+def load_data(em_input_directory, mapping_log_path, read_length, batch_size, logger):
+    """Legacy loader retaining MultiHitRecord objects for Python API callers."""
+    return _load_em_data(em_input_directory, mapping_log_path, read_length,
+                         batch_size, logger, engine="python")[:4]
 
 
 def write_group_tpm_table(
@@ -738,9 +780,9 @@ def write_group_tpm_table(
                     group.unique_read_count
                 ),
                 str(
-                    len(
-                        group.multi_hit_records
-                    )
+                    group.multi_hit_record_count
+                    if group.multi_hit_record_count is not None
+                    else len(group.multi_hit_records)
                 ),
                 f"{final_expected_count:.12g}",
                 f"{initial_tpm:.12g}",
@@ -763,9 +805,16 @@ def run_group_em(
     convergence_threshold: float = 10,
     read_length: int = 30,
     batch_size: int = 100000,
+    engine: str = "numpy",
+    keep_iteration_history: bool = False,
 ) -> EmRunResult:
     """
     Run the complete group-level EM workflow.
+
+    The default NumPy backend keeps compact candidates and per-group record
+    counts, not MultiHitRecord objects. Use engine="python" for those objects
+    or to reproduce legacy arithmetic. By default histories contain iteration
+    zero and the final iteration; keep_iteration_history=True retains all.
 
     Flow:
 
@@ -778,6 +827,10 @@ def run_group_em(
         return final result
     """
 
+    if engine not in {"numpy", "python"}:
+        raise ValueError("engine must be 'numpy' or 'python'.")
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1.")
     if trial_count < 1:
         raise ValueError(
             "trial_count must be at least 1."
@@ -796,6 +849,8 @@ def run_group_em(
     logger = create_logger(
         output_log_path
     )
+    workflow_started_at = time.perf_counter()
+    logger.info("EM engine: %s; keep iteration history: %s", engine, keep_iteration_history)
 
     logger.info(
         "Group EM started"
@@ -825,12 +880,14 @@ def run_group_em(
         read_length,
     )
 
+    load_started_at = time.perf_counter()
     (
         groups,
         current_tpm_by_group,
         mapped_read_count,
         multi_record_count,
-    ) = load_data(
+        numpy_data,
+    ) = _load_em_data(
         em_input_directory=(
             em_input_directory
         ),
@@ -840,6 +897,11 @@ def run_group_em(
         read_length=read_length,
         batch_size=batch_size,
         logger=logger,
+        engine=engine,
+    )
+    logger.info(
+        "Group EM input loading elapsed: %.3f s",
+        time.perf_counter() - load_started_at,
     )
 
     completed_iterations = 0
@@ -852,11 +914,12 @@ def run_group_em(
         1,
         trial_count + 1,
     ):
+        iteration_started_at = time.perf_counter()
         (
             expected_count_by_group,
             new_tpm_by_group,
             delta,
-        ) = run_em_iteration(
+        ) = (numpy_data.iteration if numpy_data is not None else run_em_iteration)(
             groups=groups,
             current_tpm_by_group=(
                 current_tpm_by_group
@@ -872,6 +935,7 @@ def run_group_em(
             tpm_by_group=(
                 new_tpm_by_group
             ),
+            keep_iteration_history=keep_iteration_history,
         )
 
         current_tpm_by_group = (
@@ -884,12 +948,13 @@ def run_group_em(
         final_delta = delta
 
         logger.info(
-            "Iteration=%d DeltaTPMMax=%.12g TPMsum=%.6f",
+            "Iteration=%d DeltaTPMMax=%.12g TPMsum=%.6f Elapsed=%.3fs",
             iteration,
             delta,
             sum(
                 current_tpm_by_group.values()
             ),
+            time.perf_counter() - iteration_started_at,
         )
 
         if delta <= convergence_threshold:
@@ -901,9 +966,14 @@ def run_group_em(
             )
             break
 
+    output_started_at = time.perf_counter()
     write_group_tpm_table(
         groups=groups,
         output_path=output_tsv_path,
+    )
+    logger.info(
+        "Group EM output writing elapsed: %.3f s",
+        time.perf_counter() - output_started_at,
     )
 
     logger.info(
@@ -934,6 +1004,10 @@ def run_group_em(
         Path(
             output_tsv_path
         ).resolve(),
+    )
+    logger.info(
+        "Group EM total elapsed: %.3f s",
+        time.perf_counter() - workflow_started_at,
     )
 
     return EmRunResult(

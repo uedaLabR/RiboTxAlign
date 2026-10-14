@@ -5,6 +5,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from scipy.stats import pearsonr, spearmanr
@@ -15,52 +17,15 @@ from matplotlib_venn import venn2
 # Paths
 # ============================================================
 
-BASE = Path(
-    "/mnt/share/project/riboML/"
-    "validation_expression/similation/HEK293T"
-)
+# Paths are hard-coded in compare_similation_1.py, shared by both scripts.
+try:
+    from .compare_similation_1 import DATASET_PATHS, DATASETS_TO_RUN
+except ImportError:
+    from compare_similation_1 import DATASET_PATHS, DATASETS_TO_RUN
 
-PLOTS = BASE / "plots_transcript"
-PLOTS.mkdir(
-    parents=True,
-    exist_ok=True,
-)
-
-TRUTH_PROFILE = (
-    BASE
-    / "HEK293T.simulation.profile"
-)
-
-RIBOTX_MATCHING_FILES = {
-    "RiboTxAlign_LongRead":
-        BASE
-        / "RiboTxAlign_LongRead.source_rescue_matching.tsv",
-
-    "RiboTxAlign_RNASeq":
-        BASE
-        / "RiboTxAlign_RNASeq.source_rescue_matching.tsv",
-}
-
-RIBOMAP = Path(
-    "/mnt/share/project/riboML/"
-    "validation_expression/"
-    "riboMap/HEK293T/"
-    "ribomap.stats"
-)
-
-GENCODE_GFF3 = Path(
-    "/mnt/share/project/riboML/validation/reference/"
-    "gencode.v44.annotation.gff3"
-)
-
-
-DEEPSHAPE = Path(
-    "/mnt/share/project/riboML/"
-    "validation_expression/"
-    "deepShape/HEK293T/"
-    "DeepShapePrimeOutputs/"
-    "runlog_199.txt"
-)
+REPORT_DIR = Path("/mnt/share/project/riboML/validation_expression/similation/publication_tpm")
+PLOTS = REPORT_DIR
+CURRENT_DATASET = ""
 
 
 # ============================================================
@@ -110,7 +75,7 @@ def calc_corr(
         dtype=float,
     )
 
-    if len(truth) < 2:
+    if len(truth) < 2 or np.ptp(truth) == 0 or np.ptp(pred) == 0:
 
         return (
             np.nan,
@@ -614,7 +579,7 @@ def read_cds_from_gencode_gff3(path):
                         tid
                         and
                         tid.startswith(
-                            "ENST"
+                            ("ENST", "ENSMUST")
                         )
                     ):
                         transcript_ids.append(
@@ -635,7 +600,7 @@ def read_cds_from_gencode_gff3(path):
                     tid
                     and
                     tid.startswith(
-                        "ENST"
+                        ("ENST", "ENSMUST")
                     )
                 ):
                     transcript_ids.append(
@@ -1181,7 +1146,7 @@ def plot_venn(
         ],
         set_labels=(
             "Truth TPM > 0",
-            f"{method} TPM > 0",
+            f"{method} reported",
         ),
     )
 
@@ -1203,9 +1168,9 @@ def plot_venn(
         bbox_inches="tight",
     )
 
-    plt.close(
-        fig
-    )
+    fig.savefig(path.with_suffix(".pdf"), bbox_inches="tight")
+    fig.savefig(path.with_suffix(".svg"), bbox_inches="tight")
+    plt.close(fig)
 
     return path
 
@@ -1237,7 +1202,7 @@ def correlation_plot(
         ].copy()
 
         subtitle = (
-            "AND: Truth > 0 and Method > 0"
+            "AND: truth-positive and method-reported"
         )
 
     elif set_type == "OR":
@@ -1253,8 +1218,8 @@ def correlation_plot(
         ].copy()
 
         subtitle = (
-            "OR: Truth > 0 or Method > 0; "
-            "missing side = 0"
+            "OR: truth-positive or method-reported; "
+            "absent TPM = 0"
         )
 
     else:
@@ -1304,83 +1269,8 @@ def correlation_plot(
         )
     )
 
-    merge_status_col = f"{method}_merge_status"
-
-    if merge_status_col in tmp.columns:
-
-        status = (
-            tmp[merge_status_col]
-            .fillna("never_merged")
-            .astype(str)
-            .to_numpy()
-        )
-
-        plotting_groups = [
-            (
-                "never_merged",
-                "Never merged",
-                5,
-                0.35,
-                None,
-            ),
-            (
-                "reference_merge",
-                "Reference-merged",
-                12,
-                0.70,
-                "orange",
-            ),
-            (
-                "em_merge",
-                "EM-merged",
-                12,
-                0.70,
-                "red",
-            ),
-            (
-                "reference_and_em_merge",
-                "Reference + EM merged",
-                16,
-                0.80,
-                "purple",
-            ),
-        ]
-
-        for key, label, size, alpha, color in plotting_groups:
-            mask = status == key
-            n = int(mask.sum())
-
-            if n == 0:
-                continue
-
-            kwargs = {
-                "s": size,
-                "alpha": alpha,
-                "label": f"{label} (n={n:,})",
-            }
-
-            if color is not None:
-                kwargs["color"] = color
-
-            plt.scatter(
-                x[mask],
-                y[mask],
-                **kwargs,
-            )
-
-        plt.legend(
-            loc="lower right",
-            frameon=False,
-        )
-
-    else:
-
-        plt.scatter(
-            x,
-            y,
-            s=5,
-            alpha=0.4,
-        )
+    # Draw every transcript identically, independent of merge classification.
+    plt.scatter(x, y, s=5, alpha=0.4, color="black", edgecolors="none")
 
     max_value = max(
         x.max()
@@ -1401,6 +1291,7 @@ def correlation_plot(
             max_value,
         ],
         linewidth=1,
+        color="0.5",
     )
 
     plt.xlabel(
@@ -1412,7 +1303,7 @@ def correlation_plot(
     )
 
     plt.title(
-        f"{method} - {set_type}\n"
+        f"{CURRENT_DATASET}: {method} - {set_type}\n"
         f"{subtitle}"
     )
 
@@ -1447,11 +1338,17 @@ def correlation_plot(
         bbox_inches="tight",
     )
 
-    plt.close(
-        fig
-    )
+    fig.savefig(path.with_suffix(".pdf"), bbox_inches="tight")
+    fig.savefig(path.with_suffix(".svg"), bbox_inches="tight")
+    plt.close(fig)
 
+    tmp.assign(plot_x_log10=np.log10(tmp["Truth_tpm"] + 1),
+               plot_y_log10=np.log10(tmp[method_col] + 1)).to_csv(
+        path.with_suffix(".tsv"), sep="\t", index=False)
     return {
+        "dataset": CURRENT_DATASET,
+        "mae_tpm": float(np.mean(np.abs(truth - pred))) if len(truth) else np.nan,
+        "rmse_tpm": float(np.sqrt(np.mean((truth - pred) ** 2))) if len(truth) else np.nan,
         "method":
             method,
 
@@ -1476,8 +1373,21 @@ def correlation_plot(
 # Main
 # ============================================================
 
-def main():
-
+def run_dataset(dataset, config):
+    global PLOTS, CURRENT_DATASET
+    CURRENT_DATASET = dataset
+    base = config["base"]
+    PLOTS = REPORT_DIR / dataset
+    PLOTS.mkdir(parents=True, exist_ok=True)
+    TRUTH_PROFILE = base / f"{dataset}.simulation.profile"
+    RIBOTX_MATCHING_FILES = {
+        method: config["output_dir"] / f"{method}.source_rescue_matching.tsv"
+        for method in ("RiboTxAlign_LongRead", "RiboTxAlign_RNASeq")
+    }
+    RIBOMAP = config["ribomap_stats"]
+    GENCODE_GFF3 = config["annotation"]
+    DEEPSHAPE = config["deepshape_log"]
+    source_tables = []
     truth = read_truth(
         TRUTH_PROFILE
     )
@@ -1499,7 +1409,7 @@ def main():
                 f"Merge-aware matching file not found: "
                 f"{path}\n"
                 "Run "
-                "compare_simulation_longread_rnaseq_merge_aware.py "
+                "compare_similation_1.py "
                 "first."
             )
 
@@ -1732,6 +1642,10 @@ def main():
             f"{or_result['spearman']:.4f}",
         )
 
+        source = pairwise.rename(columns={f"{method}_tpm": "Predicted_tpm"}).copy()
+        source.insert(0, "method", method)
+        source.insert(0, "dataset", dataset)
+        source_tables.append(source)
         pairwise.to_csv(
             PLOTS
             / (
@@ -1751,9 +1665,8 @@ def main():
         count_records
     )
 
-    corr_df = pd.DataFrame(
-        corr_records
-    )
+    corr_df = pd.DataFrame(corr_records)
+    count_df.insert(0, "dataset", dataset)
 
     counts_path = (
         PLOTS
@@ -1789,6 +1702,18 @@ def main():
     print(
         corr_path
     )
+
+    return count_df, corr_df, pd.concat(source_tables, ignore_index=True)
+
+
+def main():
+    try:
+        from .tpm_publication_report import write_report
+    except ImportError:
+        from tpm_publication_report import write_report
+    plt.rcParams.update({"pdf.fonttype": 42, "ps.fonttype": 42, "svg.fonttype": "none"})
+    outputs = [run_dataset(dataset, DATASET_PATHS[dataset]) for dataset in DATASETS_TO_RUN]
+    write_report(REPORT_DIR, outputs)
 
 
 if __name__ == "__main__":

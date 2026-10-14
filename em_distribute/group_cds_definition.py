@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import csv
 import gzip
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TextIO
+from urllib.parse import unquote
 
 
 @dataclass(slots=True)
@@ -128,7 +130,7 @@ def _split_transcript_ids(
 def _parse_gtf_attributes(
     attribute_text: str,
 ) -> dict[str, str]:
-    """Parse one GTF attribute field."""
+    """Parse a GTF (key \"value\") or GFF3 (key=value) attribute field."""
 
     attributes: dict[str, str] = {}
 
@@ -138,19 +140,16 @@ def _parse_gtf_attributes(
         if not item:
             continue
 
-        parts = item.split(
-            None,
-            maxsplit=1,
-        )
-
-        if len(parts) != 2:
-            continue
-
-        key, value = parts
-
-        attributes[key] = (
-            value.strip().strip('"')
-        )
+        key, separator, value = item.partition("=")
+        if separator and key.strip() and not any(c.isspace() for c in key.strip()):
+            attributes[key.strip()] = unquote(value.strip())
+        else:
+            # An '=' inside a quoted GTF value is part of that value.
+            parts = item.split(None, maxsplit=1)
+            if len(parts) != 2:
+                continue
+            key, value = parts
+            attributes[key] = value.strip().strip('"')
 
     return attributes
 
@@ -329,9 +328,11 @@ def load_gencode_cds_intervals(
     ],
 ]:
     """
-    Load CDS intervals only for transcripts referenced by metadata.
+    Load GTF/GFF3 CDS intervals for transcripts referenced by metadata.
 
     Coordinates are retained as one-based inclusive genomic intervals.
+    GFF3 Parent IDs may identify transcripts directly or refer to transcript
+    features with a separate transcript_id. Feature order is unrestricted.
     """
 
     cds_by_transcript: dict[
@@ -347,7 +348,13 @@ def load_gencode_cds_intervals(
     ] = defaultdict(list)
 
     if not needed_transcript_ids:
+        print("GENCODE CDS loaded: requested_transcripts=0 matched_transcripts=0 matched_intervals=0")
         return {}
+
+    transcript_ids_by_feature: dict[str, set[str]] = {}
+    intervals_by_parent: dict[str, list[tuple[str, str, int, int]]] = defaultdict(list)
+    cds_rows = 0
+    cds_rows_without_id = 0
 
     with _open_text(
         gencode_gtf_path
@@ -363,43 +370,62 @@ def load_gencode_cds_intervals(
                 "\t"
             )
 
-            if (
-                len(fields) != 9
-                or fields[2] != "CDS"
-            ):
+            if len(fields) != 9:
                 continue
 
+            if fields[2] not in {"CDS", "transcript", "mRNA", "ncRNA"}:
+                continue
             attributes = _parse_gtf_attributes(
                 fields[8]
             )
 
-            transcript_id = (
-                _normalize_transcript_id(
-                    attributes.get(
-                        "transcript_id"
-                    )
-                )
+            transcript_ids = _split_transcript_ids(
+                attributes.get("transcript_id")
             )
-
-            if (
-                transcript_id is None
-                or transcript_id
-                not in needed_transcript_ids
-            ):
+            if fields[2] != "CDS":
+                feature_id = attributes.get("ID")
+                if feature_id:
+                    transcript_ids_by_feature[feature_id] = (
+                        transcript_ids or _split_transcript_ids(feature_id)
+                    )
                 continue
 
-            cds_by_transcript[
-                transcript_id
-            ].append(
-                (
-                    fields[0],
-                    fields[6],
-                    int(fields[3]),
-                    int(fields[4]),
-                )
-            )
+            cds_rows += 1
+            interval = (fields[0], fields[6], int(fields[3]), int(fields[4]))
+            if transcript_ids:
+                for transcript_id in transcript_ids & needed_transcript_ids:
+                    cds_by_transcript[transcript_id].append(interval)
+            elif attributes.get("Parent"):
+                for parent in attributes["Parent"].split(","):
+                    intervals_by_parent[parent.strip()].append(interval)
+            else:
+                cds_rows_without_id += 1
 
-    return dict(cds_by_transcript)
+    for parent, intervals in intervals_by_parent.items():
+        transcript_ids = transcript_ids_by_feature.get(
+            parent, _split_transcript_ids(parent)
+        )
+        for transcript_id in transcript_ids & needed_transcript_ids:
+            cds_by_transcript[transcript_id].extend(intervals)
+
+    result = {tid: sorted(set(intervals)) for tid, intervals in cds_by_transcript.items()}
+    print(
+        "GENCODE CDS loaded:", gencode_gtf_path,
+        "CDS_rows=", cds_rows,
+        "requested_transcripts=", len(needed_transcript_ids),
+        "matched_transcripts=", len(result),
+        "matched_intervals=", sum(len(intervals) for intervals in result.values()),
+        "unmatched_transcripts=", len(needed_transcript_ids - result.keys()),
+        "CDS_rows_without_transcript_id_or_Parent=", cds_rows_without_id,
+    )
+    if not result:
+        warnings.warn(
+            f"No CDS intervals matched {len(needed_transcript_ids)} requested transcripts "
+            f"in {gencode_gtf_path}; group EM will use fallback lengths. "
+            "Check the annotation format and transcript IDs.",
+            stacklevel=2,
+        )
+    return result
 
 
 def attach_cds_intervals(

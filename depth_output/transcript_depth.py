@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pipeline_profiling import measure, timed
+
 import csv
 import logging
 import shutil
@@ -497,6 +499,7 @@ def iter_read_assignments(
             )
 
 
+@timed("h.build_cds_start_profiles")
 def build_cds_start_profiles(
     reads_info_parquet: str | Path,
     transcript_definitions: dict[str, TranscriptDefinition],
@@ -800,6 +803,7 @@ def plot_psite_offsets(
     figure.savefig(path, dpi=200)
     plt.close(figure)
 
+@timed("h.build_depth_events")
 def build_depth_events(
     reads_info_parquet: str | Path,
     transcript_definitions: dict[str, TranscriptDefinition],
@@ -864,6 +868,7 @@ def build_depth_events(
 
 
 
+@timed("h.build_psite_metagene")
 def build_psite_metagene(
     psite_depth: dict[str, dict[int, float]],
     transcript_definitions: dict[str, TranscriptDefinition],
@@ -1031,6 +1036,7 @@ def plot_psite_metagene(
     figure.savefig(path, dpi=200)
     plt.close(figure)
 
+@timed("h.write_depth_bigwig")
 def write_depth_bigwig(
     coverage_events: dict[str, dict[int, float]],
     psite_depth: dict[str, dict[int, float]],
@@ -1061,13 +1067,20 @@ def write_depth_bigwig(
         )
         for transcript_id in transcript_order
     ]
+    # We emit each header entry exactly once, in header order. In bedGraph
+    # mode pyBigWig otherwise looks up the chromosome for every interval;
+    # libBigWig's chromosome lookup scans the header linearly. With many
+    # transcript references this dominates the actual writing time.
+    if len({name for name, _ in header}) != len(header):
+        raise ValueError("BigWig transcript track names must be unique.")
 
     coverage_bigwig = pyBigWig.open(str(coverage_output), "w")
     psite_bigwig = pyBigWig.open(str(psite_output), "w")
 
     try:
-        coverage_bigwig.addHeader(header)
-        psite_bigwig.addHeader(header)
+        with measure("h.transcript_bigwig_headers"):
+            coverage_bigwig.addHeader(header)
+            psite_bigwig.addHeader(header)
 
         for transcript_id in transcript_order:
             definition = transcript_definitions[transcript_id]
@@ -1095,11 +1108,13 @@ def write_depth_bigwig(
                     previous_position = position
 
                 if starts:
+                    _validate_bigwig_intervals(starts, ends, definition.transcript_length)
                     coverage_bigwig.addEntries(
                         [track_name] * len(starts),
                         starts,
                         ends=ends,
                         values=values,
+                        validate=False,
                     )
 
             positions = psite_depth.get(transcript_id, {})
@@ -1111,13 +1126,14 @@ def write_depth_bigwig(
                 ]
 
                 if sorted_positions:
+                    if sorted_positions[0] < 0 or sorted_positions[-1] >= definition.transcript_length:
+                        raise ValueError(f"P-site lies outside transcript {transcript_id}.")
+                    # variableStep takes one chromosome name for the entire
+                    # batch. Keep native order validation enabled here.
                     psite_bigwig.addEntries(
-                        [track_name] * len(sorted_positions),
+                        track_name,
                         sorted_positions,
-                        ends=[
-                            position + 1
-                            for position in sorted_positions
-                        ],
+                        span=1,
                         values=[
                             float(positions[position])
                             for position in sorted_positions
@@ -1125,8 +1141,19 @@ def write_depth_bigwig(
                     )
 
     finally:
-        coverage_bigwig.close()
-        psite_bigwig.close()
+        with measure("h.close_transcript_coverage_bigwig"):
+            coverage_bigwig.close()
+        with measure("h.close_transcript_psite_bigwig"):
+            psite_bigwig.close()
+
+
+def _validate_bigwig_intervals(starts, ends, reference_length):
+    """Validate one reference in O(intervals), without header name lookups."""
+    previous_end = 0
+    for start, end in zip(starts, ends):
+        if start < previous_end or end <= start or end > reference_length:
+            raise ValueError(f"Invalid BigWig interval: {start}-{end} / {reference_length}")
+        previous_end = end
 
 
 
@@ -1155,6 +1182,7 @@ def iter_coverage_intervals(
         previous_position = position
 
 
+@timed("h.project_depth_to_genome")
 def project_depth_to_genome(
     coverage_events: dict[str, dict[int, float]],
     psite_depth: dict[str, dict[int, float]],
@@ -1229,6 +1257,7 @@ def project_depth_to_genome(
     )
 
 
+@timed("h.write_genome_bigwig")
 def write_genome_bigwig(
     genome_coverage_events: dict[
         str,

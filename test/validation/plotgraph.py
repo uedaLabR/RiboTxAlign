@@ -1,8 +1,12 @@
 from pathlib import Path
+import argparse
 
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 
 # ============================================================
@@ -15,7 +19,7 @@ BASE = Path(
 
 COMPARISON_ROOT = (
     BASE
-    / "bam_comparison_four_mappers"
+    / "bam_comparison_four_mappers_counts"
 )
 
 OUTPUT_DIR = (
@@ -23,10 +27,7 @@ OUTPUT_DIR = (
     / "summary"
 )
 
-OUTPUT_DIR.mkdir(
-    parents=True,
-    exist_ok=True,
-)
+SCOPE = "all_mapper_reads"
 
 EXCEL_PATH = (
     OUTPUT_DIR
@@ -100,9 +101,7 @@ def select_all_scope(
     input_path,
 ):
     """
-    Use all mapper reads.
-
-    common_to_all is intentionally not used.
+    Select the requested read population consistently for mapping and NH.
     """
 
     if "scope" not in df.columns:
@@ -116,7 +115,7 @@ def select_all_scope(
         .tolist()
     )
 
-    target_scope = "all_mapper_reads"
+    target_scope = SCOPE
 
     if target_scope not in scopes:
         raise RuntimeError(
@@ -221,7 +220,7 @@ def recalculate_mapping_statistics(
     """
     For each sample:
 
-        true total reads
+        estimated total reads
             = maximum reported total_reads among all mappers
 
     Then:
@@ -251,6 +250,19 @@ def recalculate_mapping_statistics(
             )
 
     df = df.copy()
+    keys = ["dataset", "sample", "mapper"]
+    if df.duplicated(keys).any():
+        raise ValueError("Duplicate dataset/sample/mapper rows in selected scope")
+    for column in required_columns:
+        values = pd.to_numeric(df[column], errors="raise")
+        if values.isna().any() or (values < 0).any() or (values % 1 != 0).any():
+            raise ValueError(f"Invalid read counts in {column}")
+        df[column] = values
+    if ((df.unique_reads + df.multi_reads) > df.total_reads).any():
+        raise ValueError("Mapped read counts exceed the mapper-reported total")
+    for _, group in df.groupby(["dataset", "sample"]):
+        if set(group.mapper) != set(MAPPERS):
+            raise ValueError("Each sample must contain all four mapper summaries")
 
     # --------------------------------------------------------
     # Keep mapper-reported total for reference.
@@ -263,6 +275,9 @@ def recalculate_mapping_statistics(
             "total_reads"
         ]
     )
+    if "unmapped_reads" in df:
+        df["reported_unmapped_reads"] = df["unmapped_reads"]
+    df["denominator_definition"] = "maximum_observed_mapper_total"
 
     # --------------------------------------------------------
     # Determine true total number of reads for each sample.
@@ -551,23 +566,16 @@ def load_nh_distribution(
             )
 
             if not nh_path.exists():
+                raise FileNotFoundError(f"NH source data missing: {nh_path}")
 
-                print(
-                    f"WARNING: not found: "
-                    f"{nh_path}"
-                )
+            try:
+                multi_df = pd.read_csv(nh_path, sep="\t")
+            except pd.errors.EmptyDataError:
+                multi_df = pd.DataFrame(columns=["mapper", "nh", "read_count"])
 
-                continue
-
-            multi_df = pd.read_csv(
-                nh_path,
-                sep="\t",
-            )
-
-            multi_df = select_all_scope(
-                df=multi_df,
-                input_path=nh_path,
-            )
+            # A valid population with no multi-hits has no NH rows.
+            if "scope" in multi_df:
+                multi_df = multi_df[multi_df.scope == SCOPE].copy()
 
             for mapper in MAPPERS:
 
@@ -647,6 +655,9 @@ def load_nh_distribution(
                         == mapper
                     ]
                 )
+                expected_multi = int(mapper_summary.iloc[0]["multi_reads"])
+                if mapper_multi["read_count"].sum() != expected_multi:
+                    raise ValueError(f"NH counts do not match multi_reads: {dataset}/{sample}/{mapper}")
 
                 for (
                     _,
@@ -734,6 +745,17 @@ def load_nh_distribution(
             ),
         )
     )
+
+    # Every sample must contribute to every bin, including zero-hit bins.
+    # Otherwise a bin observed in only one replicate gets an inflated mean.
+    keys = ["dataset", "sample", "mapper"]
+    grid = mapping_summary[keys + ["total_reads"]].merge(
+        pd.DataFrame({"nh_group": range(1, NH_MAX + 1)}), how="cross")
+    result = grid.merge(result[keys + ["nh_group", "read_count"]],
+                        on=keys + ["nh_group"], how="left", validate="one_to_one")
+    result["read_count"] = result.read_count.fillna(0).astype(int)
+    result["percent_of_total"] = result.read_count / result.total_reads.replace(0, np.nan) * 100
+    result = result.drop(columns="total_reads")
 
     return result
 
@@ -939,6 +961,7 @@ def plot_mapping_composition(
         unique_mean,
         yerr=unique_sd,
         fmt="none",
+        ecolor="black",
         capsize=4,
         linewidth=1.2,
         zorder=6,
@@ -949,6 +972,7 @@ def plot_mapping_composition(
         mapped_mean,
         yerr=mapped_sd,
         fmt="none",
+        ecolor="black",
         capsize=4,
         linewidth=1.2,
         zorder=6,
@@ -968,13 +992,7 @@ def plot_mapping_composition(
         ]
     )
 
-    offsets = np.linspace(
-        -0.16,
-        0.16,
-        len(
-            samples
-        ),
-    )
+    offsets = np.linspace(-0.16, 0.16, len(samples)) if len(samples) > 1 else np.array([0.0])
 
     for (
         mapper_index,
@@ -1040,24 +1058,26 @@ def plot_mapping_composition(
             ax.scatter(
                 point_x,
                 unique_boundary,
-                s=26,
+                s=42,
                 marker="o",
-                facecolors="none",
+                facecolors="white",
                 edgecolors="black",
                 linewidths=1.0,
                 zorder=7,
+                clip_on=False,
             )
 
             # Unique + Multi boundary
             ax.scatter(
                 point_x,
                 mapped_boundary,
-                s=30,
+                s=46,
                 marker="^",
-                facecolors="none",
+                facecolors="white",
                 edgecolors="black",
                 linewidths=1.0,
                 zorder=7,
+                clip_on=False,
             )
 
     # --------------------------------------------------------
@@ -1093,7 +1113,13 @@ def plot_mapping_composition(
         dataset
     )
 
+    handles, labels = ax.get_legend_handles_labels()
+    handles.extend([
+        Line2D([], [], marker="o", linestyle="none", markerfacecolor="white", color="black", label="Sample: unique"),
+        Line2D([], [], marker="^", linestyle="none", markerfacecolor="white", color="black", label="Sample: all mapped"),
+    ])
     ax.legend(
+        handles=handles,
         frameon=False,
         loc="upper left",
         bbox_to_anchor=(
@@ -1146,6 +1172,7 @@ def plot_mapping_composition(
         output_pdf,
         bbox_inches="tight",
     )
+    fig.savefig(output_pdf.with_suffix(".svg"), bbox_inches="tight")
 
     plt.close(
         fig
@@ -1295,13 +1322,7 @@ def plot_nh_distribution(
             ]
         )
 
-        offsets = np.linspace(
-            -0.16,
-            0.16,
-            len(
-                samples
-            ),
-        )
+        offsets = np.linspace(-0.16, 0.16, len(samples)) if len(samples) > 1 else np.array([0.0])
 
         for (
             nh_index,
@@ -1351,10 +1372,11 @@ def plot_nh_distribution(
                         sample_index
                     ],
                     value,
-                    s=20,
-                    facecolors="none",
+                    s=32,
+                    facecolors="white",
                     edgecolors="black",
                     zorder=5,
+                    clip_on=False,
                 )
 
         labels = [
@@ -1415,6 +1437,9 @@ def plot_nh_distribution(
         dataset,
         y=1.02,
     )
+    axes[-1].legend(handles=[Line2D([], [], marker="o", linestyle="none",
+                                   markerfacecolor="white", color="black",
+                                   label="Each point: one sample")], frameon=False)
 
     plt.tight_layout()
 
@@ -1444,6 +1469,7 @@ def plot_nh_distribution(
         output_pdf,
         bbox_inches="tight",
     )
+    fig.savefig(output_pdf.with_suffix(".svg"), bbox_inches="tight")
 
     plt.close(
         fig
@@ -1697,6 +1723,12 @@ def save_excel(
         engine="openpyxl",
     ) as writer:
 
+        try:
+            from .publication_report import write_publication_sheets
+        except ImportError:
+            from publication_report import write_publication_sheets
+        write_publication_sheets(writer, mapping_summary, nh_df, COMPARISON_ROOT, SCOPE)
+
         mapping_counts.to_excel(
             writer,
             sheet_name="Mapping_counts",
@@ -1720,6 +1752,22 @@ def save_excel(
             sheet_name="NH_percent",
             index=False,
         )
+
+        from openpyxl.styles import Alignment, Font, PatternFill
+        for sheet in writer.book.worksheets:
+            sheet.freeze_panes = "A2"
+            sheet.auto_filter.ref = sheet.dimensions
+            for cell in sheet[1]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="17365D")
+                cell.alignment = Alignment(wrap_text=True, vertical="center")
+            sheet.row_dimensions[1].height = 32
+            for column in sheet.columns:
+                width = min(55, max(15, max(len(str(c.value or "")) for c in column[:150]) + 2))
+                sheet.column_dimensions[column[0].column_letter].width = width
+                for cell in column[1:]:
+                    if isinstance(cell.value, (int, float)):
+                        cell.number_format = "#,##0" if isinstance(cell.value, int) else "0.00"
 
     print(
         f"Saved Excel: "
@@ -1859,7 +1907,24 @@ def print_consistency_check(
 # Main
 # ============================================================
 
-def main():
+def main(argv=None):
+    global COMPARISON_ROOT, OUTPUT_DIR, EXCEL_PATH, DATASETS, SCOPE
+    parser = argparse.ArgumentParser(description="Excel and publication figures from Bam4Comapre TSV outputs")
+    parser.add_argument("--comparison-root", type=Path, default=COMPARISON_ROOT)
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--scope", choices=["all_mapper_reads", "common_to_all"], default="all_mapper_reads")
+    args = parser.parse_args(argv)
+    COMPARISON_ROOT = args.comparison_root
+    OUTPUT_DIR = args.output_dir or COMPARISON_ROOT / "summary"
+    EXCEL_PATH = OUTPUT_DIR / "mapping_comparison_summary.xlsx"
+    SCOPE = args.scope
+    DATASETS = {}
+    for path in sorted(COMPARISON_ROOT.glob("*/*/mapping_summary.tsv")):
+        DATASETS.setdefault(path.parent.parent.name, {"samples": []})["samples"].append(path.parent.name)
+    if not DATASETS:
+        raise FileNotFoundError(f"No dataset/sample/mapping_summary.tsv under {COMPARISON_ROOT}")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    plt.rcParams.update({"pdf.fonttype": 42, "ps.fonttype": 42, "svg.fonttype": "none"})
 
     # ========================================================
     # Load
@@ -1874,6 +1939,12 @@ def main():
             mapping_summary
         )
     )
+
+    try:
+        from .publication_report import save_publication_tables
+    except ImportError:
+        from publication_report import save_publication_tables
+    save_publication_tables(mapping_summary, OUTPUT_DIR)
 
     # ========================================================
     # Print mapping summary

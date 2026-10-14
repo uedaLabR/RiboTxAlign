@@ -71,7 +71,8 @@ class MappyMapper:
         """
 
         read_length = len(sequence)
-        filtered: list[RawAlignment] = []
+        best_score = None
+        best_hits: list[RawAlignment] = []
 
         for hit in self.aligner.map(
             sequence,
@@ -82,43 +83,49 @@ class MappyMapper:
 
             # Transcript references are stored in the 5' to 3' direction.
             # Retain only forward-strand alignments.
-            if hit.strand != 1:
+            strand = hit.strand
+            if strand != 1:
                 continue
 
-            alignment = RawAlignment(
+            query_start, query_end = hit.q_st, hit.q_en
+            coverage = (query_end - query_start) / read_length if read_length > 0 else 0.0
+            if coverage < self.minimum_query_coverage:
+                continue
+            matching_bases, alignment_length = hit.mlen, hit.blen
+            identity = matching_bases / alignment_length if alignment_length > 0 else 0.0
+            if identity < self.minimum_identity:
+                continue
+
+            edit_distance = hit.NM
+            score = matching_bases - edit_distance
+            if best_score is not None and score < best_score:
+                continue
+            if best_score is None or score > best_score:
+                best_score = score
+                best_hits = []
+
+            # Avoid CIGAR extraction and RawAlignment allocation for rejected
+            # hits or scores already below the best accepted score. Better
+            # scores later in the iterator replace earlier candidates.
+            best_hits.append(RawAlignment(
                 read_id=read_id,
                 reference_name=hit.ctg,
                 reference_start=hit.r_st,
                 reference_end=hit.r_en,
-                query_start=hit.q_st,
-                query_end=hit.q_en,
-                strand=hit.strand,
-                matching_bases=hit.mlen,
-                alignment_length=hit.blen,
-                edit_distance=hit.NM,
+                query_start=query_start,
+                query_end=query_end,
+                strand=strand,
+                matching_bases=matching_bases,
+                alignment_length=alignment_length,
+                edit_distance=edit_distance,
                 cigartuples=[
                     (operation, length)
                     for length, operation in hit.cigar
                 ],
-            )
+            ))
 
-            if alignment.query_coverage(read_length) < self.minimum_query_coverage:
-                continue
-
-            if alignment.identity < self.minimum_identity:
-                continue
-
-            filtered.append(alignment)
-
-        if not filtered:
+        if not best_hits:
             return [], False
-
-        best_score = max(alignment.score for alignment in filtered)
-        best_hits = [
-            alignment
-            for alignment in filtered
-            if alignment.score == best_score
-        ]
 
         best_hits = prefer_cds_hits(best_hits, self.cds_regions)
         best_hits.sort(

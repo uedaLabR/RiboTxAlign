@@ -60,15 +60,23 @@ DATASETS = [
             },
 
             {
-                "name": "RiboTxAlign",
+                "name": "RiboTxAlign_LongRead",
 
                 "bam": (
                     BASE
                     / "mouse_brain"
-                    / "RiboTxAlign"
-                    / "mouse_brain_simulation"
+                    / "RiboTxAlign_LongRead"
+                    / "mouse_brain_simulation_LongRead"
                     / "bam"
-                    / "mouse_brain_simulation.genome.sorted.bam"
+                    / "mouse_brain_simulation_LongRead.genome.sorted.bam"
+                ),
+            },
+            {
+                "name": "RiboTxAlign_RNASeq",
+                "bam": (
+                    BASE / "mouse_brain" / "RiboTxAlign_RNASeq"
+                    / "mouse_brain_simulation_RNASeq" / "bam"
+                    / "mouse_brain_simulation_RNASeq.genome.sorted.bam"
                 ),
             },
         ],
@@ -108,15 +116,23 @@ DATASETS = [
             },
 
             {
-                "name": "RiboTxAlign",
+                "name": "RiboTxAlign_LongRead",
 
                 "bam": (
                     BASE
                     / "HEK293T"
-                    / "RiboTxAlign"
-                    / "HEK293T_simulation"
+                    / "RiboTxAlign_LongRead"
+                    / "HEK293T_simulation_LongRead"
                     / "bam"
-                    / "HEK293T_simulation.genome.sorted.bam"
+                    / "HEK293T_simulation_LongRead.genome.sorted.bam"
+                ),
+            },
+            {
+                "name": "RiboTxAlign_RNASeq",
+                "bam": (
+                    BASE / "HEK293T" / "RiboTxAlign_RNASeq"
+                    / "HEK293T_simulation_RNASeq" / "bam"
+                    / "HEK293T_simulation_RNASeq.genome.sorted.bam"
                 ),
             },
         ],
@@ -131,6 +147,11 @@ OUTPUT = (
 
 
 DEBUG_MAX = 100
+
+
+def is_ribotx_mapper(name: str) -> bool:
+    """Recognize legacy and separately named StringTie reference runs."""
+    return name == "RiboTxAlign" or name.startswith("RiboTxAlign_")
 
 
 HEADER_PATTERN = re.compile(
@@ -309,14 +330,16 @@ def load_transcript_id_map(
     """
     FASTQ header uses simulation_transcript_id.
 
-    Simulation GTF uses stringtie_transcript_id.
+    Simulation GTF uses StringTie IDs. CDS-collapsed simulation inputs use
+    representative_stringtie_transcript_id; older inputs use stringtie_transcript_id.
+    Member IDs are not interchangeable with the representative's coordinates.
     """
 
     result = {}
 
-    with transcript_info_path.open(
+    with Path(transcript_info_path).open(
         "r",
-        encoding="utf-8",
+        encoding="utf-8-sig",
         newline="",
     ) as handle:
 
@@ -325,15 +348,36 @@ def load_transcript_id_map(
             delimiter="\t",
         )
 
+        fields = reader.fieldnames or []
+        target_columns = [name for name in (
+            "representative_stringtie_transcript_id", "stringtie_transcript_id"
+        ) if name in fields]
+        if "simulation_transcript_id" not in fields or not target_columns:
+            raise ValueError(
+                f"Invalid simulation transcript info: {transcript_info_path}. "
+                "Required: simulation_transcript_id and representative_stringtie_transcript_id "
+                f"(or legacy stringtie_transcript_id). Found columns: {fields}"
+            )
         for row in reader:
-
-            result[
-                row[
-                    "simulation_transcript_id"
-                ]
-            ] = row[
-                "stringtie_transcript_id"
-            ]
+            simulation_id = (row.get("simulation_transcript_id") or "").strip()
+            target_id = (row.get(target_columns[0]) or "").strip()
+            if simulation_id in ("", ".") or target_id in ("", "."):
+                raise ValueError(
+                    f"Missing transcript ID in {transcript_info_path}, line {reader.line_num}"
+                )
+            if len(target_columns) == 2:
+                legacy_id = (row.get("stringtie_transcript_id") or "").strip()
+                if legacy_id not in ("", ".", target_id):
+                    raise ValueError(
+                        f"Conflicting representative/legacy StringTie IDs for {simulation_id} "
+                        f"in {transcript_info_path}, line {reader.line_num}"
+                    )
+            if simulation_id in result and result[simulation_id] != target_id:
+                raise ValueError(
+                    f"Conflicting StringTie IDs for {simulation_id} in {transcript_info_path}, "
+                    f"line {reader.line_num}"
+                )
+            result[simulation_id] = target_id
 
     return result
 
@@ -1853,6 +1897,7 @@ def write_nh_accuracy_tables(
                 [
                     "dataset",
                     nh_column_name,
+                    "mapper",
                     "total",
                     "correct",
                     "observed_accuracy_percent",
@@ -1868,10 +1913,7 @@ def write_nh_accuracy_tables(
                 counts,
             ) in results:
 
-                if (
-                    mapper_name
-                    != "RiboTxAlign"
-                ):
+                if not is_ribotx_mapper(mapper_name):
                     continue
 
                 nh_values = sorted(
@@ -1950,6 +1992,7 @@ def write_nh_accuracy_tables(
                         [
                             dataset_name,
                             nh,
+                            mapper_name,
                             total,
                             correct,
                             f"{observed:.4f}",
@@ -2297,12 +2340,7 @@ def main():
                         ),
                         star_multi_ids=(
                             star_multi_ids
-                            if (
-                                mapper[
-                                    "name"
-                                ]
-                                == "RiboTxAlign"
-                            )
+                            if is_ribotx_mapper(mapper["name"])
                             else None
                         ),
                     )
@@ -2339,12 +2377,7 @@ def main():
                 # RiboTxAlign-specific summary
                 # --------------------------------------------
 
-                if (
-                    mapper[
-                        "name"
-                    ]
-                    == "RiboTxAlign"
-                ):
+                if is_ribotx_mapper(mapper["name"]):
 
                     multi_total = (
                         counts[

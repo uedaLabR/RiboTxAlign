@@ -5,7 +5,6 @@ reference:
   genome_fai: /mnt/share/project/riboML/validation/reference/mm10.fa.fai
 
 pipeline:
-  use_deduplicated_fastq: true
   # Remove temporary mapping, EM-input, and BAM-partition files after success.
   delete_intermediate_files: true
 
@@ -15,7 +14,7 @@ mapping:
   maximum_reads: null
   maximum_candidates: 16
   kmer_size: 11
-  window_size: 2
+  window_size: 3
   minimum_minimizers: 1
   minimum_chain_score: 10
   minimum_dp_score: 10
@@ -30,8 +29,9 @@ mapping:
   start_method: spawn
 
 rescue:
-  preset: sr
-  kmer_size: 11
+  contiguous_preset: sr
+  splice_preset: splice
+  kmer_size: 13
   window_size: 3
   minimum_minimizers: 1
   minimum_chain_score: 10
@@ -58,6 +58,8 @@ group_input:
   minimum_transcript_fraction: 0.3333333333
 
 group_em:
+  engine: numpy
+  keep_iteration_history: false
   trial_count: 300
   convergence_threshold: 60.0
   read_length: 32

@@ -697,6 +697,9 @@ def extract_em_input(
         output_directory
     ).resolve()
 
+    if output_path == sorted_directory:
+        raise ValueError("Sorted-mapping and EM-input directories must be different.")
+
     if not sorted_directory.is_dir():
         raise NotADirectoryError(
             "Sorted mapping directory was not found: "
@@ -724,6 +727,24 @@ def extract_em_input(
         parents=True,
         exist_ok=True,
     )
+
+    # Remove all shards owned by this stage, including chromosomes absent
+    # from the new sorted inputs. Per-worker replacement alone leaves these
+    # old shards visible to group EM on a rerun.
+    previous_outputs = sorted([
+        *output_path.glob("*.group_info.parquet"),
+        *output_path.glob("*.multi_reads.parquet"),
+    ])
+    if previous_outputs and not overwrite:
+        raise FileExistsError(
+            f"EM-input directory already contains {len(previous_outputs)} shard(s), "
+            f"including: {previous_outputs[0]}. Use a fresh output directory or set "
+            "group_input.overwrite: true (overwrite=True in the Python API) for a full restart."
+        )
+    if previous_outputs:
+        print(f"Removing {len(previous_outputs):,} previous EM-input shards for a fresh run", flush=True)
+        for previous_output in previous_outputs:
+            previous_output.unlink()
 
     # Make the large annotation object available before fork.
     initialize_worker(

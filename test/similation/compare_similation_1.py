@@ -13,38 +13,33 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 # Configuration
 # ============================================================
 
-BASE = Path(
-    "/mnt/share/project/riboML/"
-    "validation_expression/similation/HEK293T"
-)
-
-ANNOTATION = Path(
-    "/mnt/share/project/riboML/validation/reference/"
-    "gencode.v44.annotation.gff3"
-)
-
-RIBOMAP_STATS = Path(
-    "/mnt/share/project/riboML/"
-    "validation_expression/riboMap/HEK293T/ribomap.stats"
-)
-
-DEEPSHAPE_LOG = Path(
-    "/mnt/share/project/riboML/"
-    "validation_expression/deepShape/HEK293T/"
-    "DeepShapePrimeOutputs/runlog_199.txt"
-)
-
-# Each directory is searched recursively for exactly one
-# *transcript_tpm_with_source.tsv file.
-RIBOTX_METHOD_DIRS = {
-    "RiboTxAlign_LongRead": BASE / "RiboTxAlign_LongRead",
-    "RiboTxAlign_RNASeq": BASE / "RiboTxAlign_RNASeq",
+# Edit these settings once; running without arguments evaluates both datasets.
+DATASETS_TO_RUN = ("HEK293T", "mouse_brain")
+DATASET_PATHS = {
+    "HEK293T": {
+        "base": Path("/mnt/share/project/riboML/validation_expression/similation/HEK293T"),
+        "output_dir": Path("/mnt/share/project/riboML/validation_expression/similation/HEK293T"),
+        "ribotx_method_dirs": {
+            "RiboTxAlign_LongRead": Path("/mnt/share/project/riboML/validation_expression/similation/HEK293T/RiboTxAlign_LongRead"),
+            "RiboTxAlign_RNASeq": Path("/mnt/share/project/riboML/validation_expression/similation/HEK293T/RiboTxAlign_RNASeq"),
+        },
+        "annotation": Path("/mnt/share/project/riboML/validation/reference/gencode.v44.annotation.gff3"),
+        "ribomap_stats": Path("/mnt/share/project/riboML/validation_expression/riboMap/HEK293T/ribomap.stats"),
+        "deepshape_log": Path("/mnt/share/project/riboML/validation_expression/deepShape/HEK293T/DeepShapePrimeOutputs/runlog_199.txt"),
+    },
+    "mouse_brain": {
+        "base": Path("/mnt/share/project/riboML/validation_expression/similation/mouse_brain"),
+        "output_dir": Path("/mnt/share/project/riboML/validation_expression/similation/mouse_brain"),
+        "ribotx_method_dirs": {
+            "RiboTxAlign_LongRead": Path("/mnt/share/project/riboML/validation_expression/similation/mouse_brain/RiboTxAlign_LongRead"),
+            "RiboTxAlign_RNASeq": Path("/mnt/share/project/riboML/validation_expression/similation/mouse_brain/RiboTxAlign_RNASeq"),
+        },
+        "annotation": Path("/mnt/share/project/riboML/validation/reference/gencode.vM25.annotation.gff3"),
+        "ribomap_stats": Path("/mnt/share/project/riboML/validation_expression/riboMap/mouse_brain/ribomap.stats"),
+        # Use the same iteration as the HEK293T comparison.
+        "deepshape_log": Path("/mnt/share/project/riboML/validation_expression/deepShape/mouse_brain/DeepShapePrimeOutputs/runlog_199.txt"),
+    },
 }
-
-# If the old RiboTxAlign result should also be included,
-# uncomment the following line:
-#
-# RIBOTX_METHOD_DIRS["RiboTxAlign_Old"] = BASE / "RiboTxAlign"
 
 
 # ============================================================
@@ -410,8 +405,8 @@ def read_transcript_gene(path):
             if (
                 transcript_id
                 and gene_id
-                and transcript_id.startswith("ENST")
-                and gene_id.startswith("ENSG")
+                and transcript_id.startswith(("ENST", "ENSMUST"))
+                and gene_id.startswith(("ENSG", "ENSMUSG"))
             ):
                 records.append({
                     "transcript_id":
@@ -421,7 +416,7 @@ def read_transcript_gene(path):
                 })
 
     df = (
-        pd.DataFrame(records)
+        pd.DataFrame(records, columns=["transcript_id", "truth_gene_id"])
         .drop_duplicates(
             "transcript_id"
         )
@@ -508,7 +503,7 @@ def evaluation_transcript_id(row):
             f"Conflicting GENCODE identity for {row.get('reference_id')}: "
             f"{original} versus {representative}"
         )
-    if original and original == representative and original.startswith("ENST"):
+    if original and original == representative and original.startswith(("ENST", "ENSMUST")):
         return original
     return None
 
@@ -779,7 +774,7 @@ def match_ribotx(
        - If a truth transcript's pre-EM reference was merged into another
          reference, use the FINAL TPM of the terminal merge target as-is.
        - No redistribution is performed.
-    3. Unique overlap-group rescue
+    3. Unambiguous metadata reference, then unique overlap-group rescue
     4. Gene-level TPM redistribution
     5. Unresolved
     """
@@ -1003,7 +998,32 @@ def match_ribotx(
     )
 
     # --------------------------------------------------------
-    # 3. Overlap-group rescue
+    # 3. Explicit metadata membership in a surviving reference
+    # A non-representative member must not fall through to an unrelated
+    # unused isoform in the same gene (e.g. DIDO1). This is a reference-level
+    # correspondence, NOT an independent estimate for each member isoform.
+    # Require one metadata reference, including absent references when
+    # checking ambiguity; do not select by abundance or by Truth count.
+    for truth_id in sorted(unmatched):
+        refs = {
+            item["reference_id"]
+            for item in truth_to_metadata_refs.get(truth_id, [])
+        }
+        if len(refs) != 1:
+            continue
+        reference_id = next(iter(refs))
+        if reference_id not in final_by_reference:
+            continue
+        assignments.append(make_assignment(
+            truth_id, final_by_reference[reference_id],
+            "metadata_reference", prefix,
+        ))
+        used_refs.add(reference_id)
+
+    assigned = {row["transcript_id"] for row in assignments}
+    unmatched = truth_ids - assigned
+
+    # 4. Overlap-group rescue
     # --------------------------------------------------------
 
     truth_to_groups = {}
@@ -1332,6 +1352,7 @@ def match_ribotx(
     for name in [
         "exact_source",
         "em_merge_target",
+        "metadata_reference",
         "unique_group_rescue",
         "gene_average_rescue",
         "unresolved",
@@ -1906,7 +1927,7 @@ def get_ribotx_gene_id(
             gene_id,
             str,
         )
-        and gene_id.startswith("ENSG")
+        and gene_id.startswith(("ENSG", "ENSMUSG"))
     ):
         return gene_id
 
@@ -2724,14 +2745,43 @@ def evaluate_gene_level(
 # Main
 # ============================================================
 
-def main():
+def build_comparison_config(dataset):
+    """Use only the hard-coded settings at the top of this file."""
+    config = dict(DATASET_PATHS[dataset])
+    if config["deepshape_log"] is None:
+        raise ValueError(
+            f"Set DATASET_PATHS['{dataset}']['deepshape_log'] to the actual runlog Path."
+        )
+    config["dataset"] = dataset
+    return config
+
+
+def run_comparison(config):
+    dataset = config["dataset"]
+    BASE = config["base"]
+    ANNOTATION = config["annotation"]
+    RIBOMAP_STATS = config["ribomap_stats"]
+    DEEPSHAPE_LOG = config["deepshape_log"]
+    RIBOTX_METHOD_DIRS = config["ribotx_method_dirs"]
+    required = [ANNOTATION, RIBOMAP_STATS, DEEPSHAPE_LOG,
+                BASE / f"{dataset}.simulation.profile",
+                BASE / f"{dataset}.simulation_abundance.sf",
+                BASE / f"{dataset}.simulation_cds.txt"]
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise FileNotFoundError("Missing comparison inputs:\n" + "\n".join(missing))
+    for directory in RIBOTX_METHOD_DIRS.values():
+        find_ribotx_result(directory)
+        find_ribotx_metadata(directory)
+        find_ribotx_merge(directory)
+    print(f"Dataset: {dataset}\nAnnotation: {ANNOTATION}\nRiboMap: {RIBOMAP_STATS}\nDeepShape: {DEEPSHAPE_LOG}")
 
     truth = read_truth(
-        BASE / "HEK293T.simulation.profile"
+        BASE / f"{dataset}.simulation.profile"
     )
 
     rna = read_rna(
-        BASE / "HEK293T.simulation_abundance.sf"
+        BASE / f"{dataset}.simulation_abundance.sf"
     )
 
     transcript_gene = (
@@ -2834,7 +2884,7 @@ def main():
         RIBOMAP_STATS,
         read_cds(
             BASE
-            / "HEK293T.simulation_cds.txt"
+            / f"{dataset}.simulation_cds.txt"
         ),
     )
 
@@ -2967,8 +3017,9 @@ def main():
     print("OUTPUT FILES")
     print("=" * 72)
 
+    config["output_dir"].mkdir(parents=True, exist_ok=True)
     for filename, df in outputs.items():
-        path = BASE / filename
+        path = config["output_dir"] / filename
 
         df.to_csv(
             path,
@@ -2977,6 +3028,12 @@ def main():
         )
 
         print(path)
+
+
+def main():
+    configs = [build_comparison_config(dataset) for dataset in DATASETS_TO_RUN]
+    for config in configs:
+        run_comparison(config)
 
 
 if __name__ == "__main__":

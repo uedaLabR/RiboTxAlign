@@ -1,5 +1,5 @@
 import csv
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 
@@ -160,7 +160,7 @@ def determine_unique_transcript_lengths(
 ):
     """Calculate approximate transcript-unique effective lengths."""
 
-    transcript_ids = list(transcript_ids)
+    transcript_ids = list(dict.fromkeys(transcript_ids))
     junctions = {
         transcript_id: get_junctions(
             reference_definitions[transcript_id]["exons"]
@@ -168,37 +168,44 @@ def determine_unique_transcript_lengths(
         for transcript_id in transcript_ids
     }
 
-    unique_lengths = {}
+    # Count each junction once per transcript instead of rebuilding the union
+    # of every other transcript's junctions for each candidate.
+    junction_counts = Counter(junction for values in junctions.values() for junction in values)
+    unique_exon_lengths = dict.fromkeys(transcript_ids, 0)
 
-    for transcript_id in transcript_ids:
-        own_exons = reference_definitions[transcript_id]["exons"]
-        other_exons = [
-            exon
-            for other_id in transcript_ids
-            if other_id != transcript_id
-            for exon in reference_definitions[other_id]["exons"]
-        ]
-        other_junctions = {
-            junction
-            for other_id in transcript_ids
-            if other_id != transcript_id
-            for junction in junctions[other_id]
-        }
+    # Sweep exon boundaries once for the whole group. A segment is unique
+    # exactly when one transcript covers it. Track exon multiplicity as well:
+    # the former per-exon calculation counted duplicate/overlapping own exons
+    # separately, while coverage by ANY other transcript excluded the segment.
+    events = defaultdict(list)
+    for tid in transcript_ids:
+        for start, end in reference_definitions[tid]["exons"]:
+            if start < end:
+                events[start].append((tid, 1))
+                events[end].append((tid, -1))
 
-        unique_exon_length = calculate_unique_exon_length(
-            own_exons=own_exons,
-            other_exons=other_exons,
-        )
-        unique_junction_count = len(
-            junctions[transcript_id] - other_junctions
-        )
+    active = {}
+    previous_position = 0
+    for position in sorted(events):
+        if len(active) == 1:
+            tid, multiplicity = next(iter(active.items()))
+            unique_exon_lengths[tid] += (position - previous_position) * multiplicity
+        # Process every event at a shared boundary before the next segment;
+        # touching half-open exons do not overlap.
+        for tid, change in events[position]:
+            count = active.get(tid, 0) + change
+            if count:
+                active[tid] = count
+            else:
+                active.pop(tid, None)
+        previous_position = position
 
-        unique_lengths[transcript_id] = (
-            unique_exon_length
-            + unique_junction_count * unique_junction_length
-        )
-
-    return unique_lengths
+    return {
+        tid: unique_exon_lengths[tid]
+        + sum(junction_counts[junction] == 1 for junction in junctions[tid])
+        * unique_junction_length
+        for tid in transcript_ids
+    }
 
 
 def determine_transcript_lengths(

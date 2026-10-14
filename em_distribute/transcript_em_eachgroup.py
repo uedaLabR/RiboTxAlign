@@ -18,6 +18,7 @@ def prepare_read_hits(
     """
 
     read_data = {}
+    group_probability_cache = {}
 
     for record in group_records:
         read_id = record["read_id"]
@@ -31,11 +32,19 @@ def prepare_read_hits(
             if other_group_ids is None:
                 other_group_ids = []
 
-            prior_probability = calculate_group_probability(
-                group_id=group_id,
-                other_group_ids=other_group_ids,
-                group_tpm=group_tpm,
-            )
+            # Group TPM is fixed throughout transcript EM. Reuse the same
+            # posterior for an identical ordered candidate-group pattern.
+            group_pattern = tuple(other_group_ids)
+            prior_probability = group_probability_cache.get(group_pattern)
+            if prior_probability is None:
+                prior_probability = calculate_group_probability(
+                    group_id=group_id,
+                    other_group_ids=other_group_ids,
+                    group_tpm=group_tpm,
+                )
+                if len(group_probability_cache) >= 4096:
+                    group_probability_cache.clear()
+                group_probability_cache[group_pattern] = prior_probability
 
             read_data[read_id] = {
                 "read_id": read_id,
@@ -716,6 +725,36 @@ def calculate_transcript_probabilities(
     }
 
 
+def aggregate_em_read_patterns(read_hits):
+    """Combine weights with identical candidate sets for EM only.
+
+    prepare_read_hits has already removed duplicate read-transcript pairs.
+    The E-step uses only candidate IDs and prior_probability; alignment
+    details remain in the original read_hits for final per-read output.
+    Summation order differs from the read-wise E-step, so floating-point
+    roundoff (and a stopping iteration at the tolerance boundary) can differ.
+    """
+    pattern_weights = {}
+    for read_info in read_hits:
+        candidates = tuple(sorted(
+            hit["transcript_id"] for hit in read_info["candidate_hits"]
+        ))
+        pattern_weights[candidates] = (
+            pattern_weights.get(candidates, 0.0)
+            + read_info["prior_probability"]
+        )
+    return [
+        {
+            "prior_probability": weight,
+            "candidate_hits": [
+                {"transcript_id": transcript_id}
+                for transcript_id in candidates
+            ],
+        }
+        for candidates, weight in pattern_weights.items()
+    ]
+
+
 def distribute_reads(
     transcript_ids,
     read_hits,
@@ -783,34 +822,41 @@ def append_final_read_information(
 ):
     """Append final read-transcript probabilities."""
 
+    pattern_cache = {}
     for read_info in read_hits:
         candidate_hits = read_info[
             "candidate_hits"
         ]
 
-        transcript_probabilities = (
-            calculate_transcript_probabilities(
+        # Keep candidate order in the key so posterior sums retain the exact
+        # same floating-point order. Alignment coordinates remain read-specific.
+        candidate_transcript_ids = tuple(
+            hit["transcript_id"]
+            for hit in candidate_hits
+        )
+        cached = pattern_cache.get(candidate_transcript_ids)
+        if cached is None:
+            transcript_probabilities = calculate_transcript_probabilities(
                 candidate_hits=candidate_hits,
                 current_tpm=final_tpm,
             )
-        )
-
-        candidate_transcript_ids = [
-            hit["transcript_id"]
-            for hit in candidate_hits
-        ]
+            others_by_transcript = {
+                tid: [other for other in candidate_transcript_ids if other != tid]
+                for tid in candidate_transcript_ids
+            }
+            cached = (transcript_probabilities, others_by_transcript)
+            if len(pattern_cache) >= 4096:
+                pattern_cache.clear()
+            pattern_cache[candidate_transcript_ids] = cached
+        transcript_probabilities, others_by_transcript = cached
 
         for hit in candidate_hits:
             transcript_id = hit[
                 "transcript_id"
             ]
 
-            other_transcript_ids = [
-                candidate_id
-                for candidate_id
-                in candidate_transcript_ids
-                if candidate_id != transcript_id
-            ]
+            # Do not expose shared mutable lists between output records.
+            other_transcript_ids = others_by_transcript[transcript_id].copy()
 
             reads_info.append(
                 {
@@ -855,7 +901,7 @@ def execute_transcript_em_eachgroup(
     reads_info,
     transcript_tpm,
     reference_definitions,
-    max_iterations=1000,
+    max_iterations=200,
     convergence_threshold=1.0e-6,
     rna_prior_strength=5.0,
 ):
@@ -900,7 +946,10 @@ def execute_transcript_em_eachgroup(
         ),
     )
 
-    final_expected_counts = unique_counts
+    # Build once, outside the iteration loop. Keep read_hits intact for
+    # initialization and the final alignment-specific probability output.
+    em_read_patterns = aggregate_em_read_patterns(read_hits)
+    converged = False
 
     for iteration in range(
         1,
@@ -908,7 +957,7 @@ def execute_transcript_em_eachgroup(
     ):
         expected_counts = distribute_reads(
             transcript_ids=transcript_ids,
-            read_hits=read_hits,
+            read_hits=em_read_patterns,
             current_tpm=current_tpm,
         )
 
@@ -925,10 +974,18 @@ def execute_transcript_em_eachgroup(
         )
 
         current_tpm = new_tpm
-        final_expected_counts = expected_counts
 
         if difference <= convergence_threshold:
+            converged = True
             break
+
+    # The last M-step changed current_tpm. Recompute counts from that same
+    # final state used below for read probabilities, even at the iteration cap.
+    final_expected_counts = distribute_reads(
+        transcript_ids=transcript_ids,
+        read_hits=em_read_patterns,
+        current_tpm=current_tpm,
+    )
 
     for transcript_id in transcript_ids:
         transcript_tpm[
@@ -953,8 +1010,12 @@ def execute_transcript_em_eachgroup(
         len(transcript_ids),
         "reads",
         len(read_hits),
+        "patterns",
+        len(em_read_patterns),
         "difference",
         difference,
+        "converged",
+        converged,
     )
 
     return (

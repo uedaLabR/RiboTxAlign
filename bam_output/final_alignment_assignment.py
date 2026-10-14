@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+from pipeline_profiling import measure, timed
+
 import csv
 import logging
 import math
 import re
 from collections import defaultdict
+from contextlib import ExitStack
 from dataclasses import dataclass
+from functools import lru_cache, partial
+from itertools import groupby
 from pathlib import Path
 from typing import Iterable
 
@@ -15,6 +20,8 @@ import pyarrow.parquet as pq
 from depth_output.transcript_genome_coordinate import (
     TranscriptGenomeCoordinateConverter,
 )
+from parquet_work.buffered_writer import BufferedParquetWriter
+from parquet_work.read_id_stream import INPUT_ORDER, read_id_sorted_rows
 
 
 @dataclass(slots=True)
@@ -265,13 +272,15 @@ def _find_segment_index(
 ) -> int:
     """Return the segment containing one transcript reference position."""
 
-    for index, segment in enumerate(segments):
-        if (
-            segment.reference_start
-            <= reference_position
-            < segment.reference_end
-        ):
-            return index
+    left, right = 0, len(segments)
+    while left < right:
+        index = (left + right) // 2
+        if segments[index].reference_end <= reference_position:
+            left = index + 1
+        else:
+            right = index
+    if left < len(segments) and segments[left].reference_start <= reference_position:
+        return left
 
     raise ValueError(
         f"Transcript coordinate is outside the reference: "
@@ -326,6 +335,28 @@ def build_genome_cigar(
 
     if not segments:
         return None
+
+    # Most footprints are an unclipped match within one exon. Avoid parsing
+    # and rebuilding operation/block lists for that case; splice/indel/clip
+    # alignments still use the general projection below.
+    if (
+        transcript_cigar.endswith("M")
+        and transcript_cigar[:-1].isascii()
+        and transcript_cigar[:-1].isdigit()
+        and int(transcript_cigar[:-1]) == read_length
+        and read_length > 0
+        and query_start == 0 and query_end == read_length
+        and 0 <= reference_start < segments[-1].reference_end
+    ):
+        segment = segments[_find_segment_index(segments, reference_start)]
+        reference_end = reference_start + read_length
+        if reference_end <= segment.reference_end:
+            if segment.strand == "+":
+                start = segment.genome_start + reference_start - segment.reference_start
+            else:
+                start = segment.genome_end - (reference_end - segment.reference_start)
+            strand = "-" if ((segment.strand == "-") != (mapping_strand < 0)) else "+"
+            return segment.chrom, start, start + read_length, strand, f"{read_length}M"
 
     operations = _add_soft_clips(
         operations=_parse_cigar(transcript_cigar),
@@ -453,11 +484,11 @@ def build_genome_cigar(
     )
 
 
-def iter_reads_info_rows(
+def iter_reads_info_batches(
     reads_info_parquet: str | Path,
     batch_size: int,
-) -> Iterable[dict]:
-    """Yield read-candidate rows from one Parquet file or directory."""
+) -> Iterable[pa.RecordBatch]:
+    """Read only required columns, with a common schema for spill files."""
 
     input_path = Path(reads_info_parquet)
 
@@ -488,8 +519,8 @@ def iter_reads_info_rows(
     }
 
     for parquet_path in parquet_paths:
-        parquet_file = pq.ParquetFile(parquet_path)
-        schema_names = set(parquet_file.schema_arrow.names)
+        with pq.ParquetFile(parquet_path) as parquet_file:
+            schema_names = set(parquet_file.schema_arrow.names)
         missing = sorted(required_columns - schema_names)
 
         if missing:
@@ -516,39 +547,89 @@ def iter_reads_info_rows(
         if "read_length" in schema_names:
             columns.append("read_length")
 
-        for batch in parquet_file.iter_batches(
-            batch_size=batch_size,
-            columns=columns,
-        ):
-            yield from batch.to_pylist()
+        # Normalize optional read_length across files. A null preserves the
+        # original projection fallback to end-start.
+        with pq.ParquetFile(parquet_path) as parquet_file:
+            for batch in parquet_file.iter_batches(batch_size=batch_size, columns=columns):
+                if "read_length" not in schema_names:
+                    batch = batch.append_column("read_length", pa.nulls(batch.num_rows, pa.int32()))
+                yield batch.cast(reads_info_projection_schema())
 
 
+def reads_info_projection_schema():
+    return pa.schema([
+        ("read_id", pa.string()), ("group_id", pa.string()),
+        ("transcript_id", pa.string()), ("alignment_transcript_id", pa.string()),
+        ("start", pa.int64()), ("end", pa.int64()),
+        ("prior_probability", pa.float64()), ("transcript_probability", pa.float64()),
+        ("hit_index", pa.int32()), ("query_start", pa.int32()), ("query_end", pa.int32()),
+        ("mapping_strand", pa.int8()), ("cigar", pa.string()), ("read_length", pa.int32()),
+    ])
+
+
+def iter_reads_info_rows(reads_info_parquet, batch_size):
+    """Compatibility iterator used by the in-memory reference implementation."""
+    for batch in iter_reads_info_batches(reads_info_parquet, batch_size):
+        yield from batch.to_pylist()
+
+
+@timed("i.load_project_candidates")
 def load_and_project_candidates(
     reads_info_parquet: str | Path,
     coordinate_table: str | Path,
     batch_size: int,
     logger: logging.Logger,
 ) -> dict[str, list[CandidateAlignment]]:
-    """Load candidate rows and project them to genome coordinates."""
+    """Legacy all-read loader retained for callers and equivalence tests.
+
+    The production assignment workflow uses the disk-backed iterator below.
+    """
+    by_read: dict[str, list[CandidateAlignment]] = defaultdict(list)
+    for _, candidate in iter_projected_candidates(
+        iter_reads_info_rows(reads_info_parquet, batch_size), coordinate_table, logger
+    ):
+        candidates = by_read[candidate.read_id]
+        if candidates:
+            candidate.read_id = candidates[0].read_id
+        candidates.append(candidate)
+    logger.info("Reads with projected candidates: %d", len(by_read))
+    return by_read
+
+
+def iter_projected_candidates(rows, coordinate_table, logger):
+    """Project rows without retaining earlier reads or candidates."""
 
     converter = TranscriptGenomeCoordinateConverter.from_coordinate_table(
         coordinate_table
     )
+    # Cache geometry only, never read IDs or posterior weights. The bound is
+    # independent of input size, and the cache dies with this iterator.
+    project = lru_cache(maxsize=65_536)(partial(build_genome_cigar, converter))
 
-    by_read: dict[str, list[CandidateAlignment]] = defaultdict(list)
+    # Arrow-to-Python conversion creates repeated strings for every row. Keep
+    # shared categorical values without interning millions of unique read IDs.
+    string_pool: dict[str, str] = {}
+
+    def shared_string(value):
+        text = str(value)
+        cached = string_pool.get(text)
+        if cached is None:
+            if len(string_pool) >= 65_536:
+                string_pool.clear()
+            string_pool[text] = text
+            return text
+        return cached
+
     input_row_count = 0
     projected_count = 0
     missing_coordinate_count = 0
 
-    for row in iter_reads_info_rows(
-        reads_info_parquet=reads_info_parquet,
-        batch_size=batch_size,
-    ):
+    for ordinal, row in enumerate(rows):
         input_row_count += 1
 
         read_id = str(row["read_id"])
-        transcript_id = str(row["transcript_id"])
-        alignment_transcript_id = str(
+        transcript_id = shared_string(row["transcript_id"])
+        alignment_transcript_id = shared_string(
             row["alignment_transcript_id"]
         )
         reference_start = _safe_int(row["start"])
@@ -568,17 +649,11 @@ def load_and_project_candidates(
             row.get("mapping_strand"),
             default=1,
         )
-        transcript_cigar = str(row["cigar"])
+        transcript_cigar = shared_string(row["cigar"])
 
-        projected = build_genome_cigar(
-            converter=converter,
-            transcript_id=alignment_transcript_id,
-            reference_start=reference_start,
-            transcript_cigar=transcript_cigar,
-            read_length=read_length,
-            query_start=query_start,
-            query_end=query_end,
-            mapping_strand=mapping_strand,
+        projected = project(
+            alignment_transcript_id, reference_start, transcript_cigar,
+            read_length, query_start, query_end, mapping_strand,
         )
 
         if projected is None:
@@ -598,17 +673,16 @@ def load_and_project_candidates(
             * _safe_float(row["transcript_probability"])
         )
 
-        by_read[read_id].append(
-            CandidateAlignment(
+        candidate = CandidateAlignment(
                 read_id=read_id,
                 transcript_id=transcript_id,
                 alignment_transcript_id=alignment_transcript_id,
-                group_id=str(row["group_id"]),
+                group_id=shared_string(row["group_id"]),
                 chrom=chrom,
                 genome_start=genome_start,
                 genome_end=genome_end,
                 strand=strand,
-                genome_cigar=genome_cigar,
+                genome_cigar=shared_string(genome_cigar),
                 posterior_probability=posterior,
                 transcript_start=reference_start,
                 transcript_end=reference_end,
@@ -618,27 +692,46 @@ def load_and_project_candidates(
                 query_end=query_end,
                 mapping_strand=mapping_strand,
                 transcript_cigar=transcript_cigar,
-            )
         )
         projected_count += 1
+        yield row.get(INPUT_ORDER, ordinal), candidate
 
     logger.info("Input candidate rows: %d", input_row_count)
     logger.info("Projected candidate rows: %d", projected_count)
+    logger.info("Projection geometry cache: %s", project.cache_info())
     logger.info(
         "Candidates without coordinate mapping: %d",
         missing_coordinate_count,
     )
-    logger.info("Reads with projected candidates: %d", len(by_read))
-
-    return by_read
 
 
-def collapse_same_genome_alignments(
+def iter_complete_read_candidates(rows, coordinate_table, logger):
+    """Collapse each complete read and release its transcript candidates."""
+    projected = iter_projected_candidates(rows, coordinate_table, logger)
+    for read_id, records in groupby(projected, key=lambda item: item[1].read_id):
+        first_order, first_candidate = next(records)
+        candidates = [first_candidate]
+        candidates.extend(candidate for _, candidate in records)
+        if len(candidates) == 1:
+            probability = first_candidate.posterior_probability
+            first_candidate.posterior_probability = (
+                1.0 if probability <= 0.0 else probability / probability
+            )
+            yield first_order, ReadCandidateSet(read_id, candidates)
+            continue
+        read_info = next(iter_collapsed_genome_alignments({read_id: candidates}, consume=True))
+        yield first_order, read_info
+
+
+def iter_collapsed_genome_alignments(
     candidates_by_read: dict[str, list[CandidateAlignment]],
-) -> list[ReadCandidateSet]:
-    """Collapse transcript candidates producing the same genomic alignment."""
+    consume: bool = False,
+) -> Iterable[ReadCandidateSet]:
+    """Collapse in input order, optionally releasing original candidates.
 
-    result: list[ReadCandidateSet] = []
+    With consume=True the caller transfers ownership of its dictionary. Empty
+    lists remain until iteration ends, so dictionary iteration order is stable.
+    """
 
     for read_id, candidates in candidates_by_read.items():
         collapsed: dict[
@@ -707,14 +800,22 @@ def collapse_same_genome_alignments(
             )
         )
 
-        result.append(
-            ReadCandidateSet(
-                read_id=read_id,
-                candidates=collapsed_candidates,
-            )
+        if consume:
+            candidates.clear()
+        yield ReadCandidateSet(
+            read_id=read_id,
+            candidates=collapsed_candidates,
         )
 
-    return result
+    if consume:
+        candidates_by_read.clear()
+
+
+def collapse_same_genome_alignments(
+    candidates_by_read: dict[str, list[CandidateAlignment]],
+) -> list[ReadCandidateSet]:
+    """Compatibility entry point retaining the caller's candidate lists."""
+    return list(iter_collapsed_genome_alignments(candidates_by_read))
 
 
 def largest_remainder_quota(
@@ -798,6 +899,7 @@ def calculate_relative_loss_delta(
     return next_loss - current_loss
 
 
+@timed("i.select_multimap")
 def assign_multimap_reads(
     multimap_reads: list[ReadCandidateSet],
     local_bin_size: int = 30,
@@ -921,16 +1023,9 @@ def assignment_row(
     }
 
 
-def write_assignment_parquet(
-    rows: list[dict],
-    output_parquet: str | Path,
-) -> None:
-    """Write final one-alignment-per-read assignments."""
-
-    output_path = Path(output_parquet)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    schema = pa.schema(
+def assignment_schema():
+    """Schema for final one-alignment-per-read assignments."""
+    return pa.schema(
         [
             pa.field("read_id", pa.string(), nullable=False),
             pa.field("chrom", pa.string(), nullable=False),
@@ -971,12 +1066,14 @@ def write_assignment_parquet(
         ]
     )
 
-    table = pa.Table.from_pylist(rows, schema=schema)
-    pq.write_table(
-        table,
-        output_path,
-        compression="zstd",
-    )
+def write_assignment_parquet(
+    rows: Iterable[dict],
+    output_parquet: str | Path,
+    batch_size: int = 100_000,
+) -> None:
+    with BufferedParquetWriter(output_parquet, assignment_schema(), batch_size) as writer:
+        for row in rows:
+            writer.append(row)
 
 
 def write_assignment_stats(
@@ -989,6 +1086,12 @@ def write_assignment_stats(
 
     for row in rows:
         counts[row["assignment_type"]] += 1
+
+    _write_assignment_counts(counts, len(rows), output_tsv)
+
+
+def _write_assignment_counts(counts, total_read_count, output_tsv):
+    """Write statistics without retaining the assignment rows."""
 
     output_path = Path(output_tsv)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1004,7 +1107,7 @@ def write_assignment_stats(
             lineterminator="\n",
         )
         writer.writerow(["metric", "value"])
-        writer.writerow(["total_assigned_reads", len(rows)])
+        writer.writerow(["total_assigned_reads", total_read_count])
 
         for assignment_type in sorted(counts):
             writer.writerow(
@@ -1028,66 +1131,65 @@ def create_final_genome_assignments(
 
     logger = _create_logger(logger)
     logger.info("Final genome assignment workflow started")
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
 
-    candidates_by_read = load_and_project_candidates(
-        reads_info_parquet=reads_info_parquet,
-        coordinate_table=coordinate_table,
-        batch_size=batch_size,
-        logger=logger,
-    )
+    counts: dict[str, int] = defaultdict(int)
+    multi_in_input_order = []
+    processed_reads = 0
+    with BufferedParquetWriter(
+        output_parquet, assignment_schema(), batch_size=min(batch_size, 100_000)
+    ) as writer:
+        with ExitStack() as stack:
+            with measure("i.group_candidates_on_disk"):
+                rows = stack.enter_context(read_id_sorted_rows(
+                    iter_reads_info_batches(reads_info_parquet, batch_size),
+                    Path(output_parquet).parent, batch_size, logger,
+                ))
+            # Only one complete read is projected/collapsed at a time. Unique
+            # reads are immediately appended to bounded output batches, never
+            # added to a sample-wide candidate dictionary.
+            with measure("i.project_collapse_write_unique"):
+                for first_order, read_info in iter_complete_read_candidates(rows, coordinate_table, logger):
+                    if read_info.candidate_count == 1:
+                        writer.append(assignment_row(
+                            read_info, read_info.candidates[0], "genome_unique"
+                        ))
+                        counts["genome_unique"] += 1
+                    else:
+                        multi_in_input_order.append((first_order, read_info))
+                    processed_reads += 1
+                    if processed_reads % 1_000_000 == 0:
+                        logger.info(
+                            "Assignment stream: reads=%d unique_emitted=%d multimap_retained=%d",
+                            processed_reads, counts.get("genome_unique", 0), len(multi_in_input_order),
+                        )
 
-    read_sets = collapse_same_genome_alignments(candidates_by_read)
+        # Restore encounter order before summing expected counts, preserving
+        # floating-point summation and the existing global multimap decisions.
+        # Unique output rows may change order; step j restores FASTQ order.
+        multi_in_input_order.sort(key=lambda item: item[0])
+        multimap_reads = [read_info for _, read_info in multi_in_input_order]
+        multi_in_input_order.clear()
 
-    unique_reads = [
-        read_info
-        for read_info in read_sets
-        if read_info.candidate_count == 1
-    ]
-    multimap_reads = [
-        read_info
-        for read_info in read_sets
-        if read_info.candidate_count > 1
-    ]
-
-    logger.info("Genome-unique reads: %d", len(unique_reads))
-    logger.info("Genome multi-map reads: %d", len(multimap_reads))
-
-    selected_multimap = assign_multimap_reads(
-        multimap_reads=multimap_reads,
-        local_bin_size=local_bin_size,
-    )
-
-    rows: list[dict] = []
-
-    for read_info in unique_reads:
-        rows.append(
-            assignment_row(
-                read_info=read_info,
-                candidate=read_info.candidates[0],
-                assignment_type="genome_unique",
-            )
+        logger.info("Reads with projected candidates: %d", counts.get("genome_unique", 0) + len(multimap_reads))
+        logger.info("Genome-unique reads: %d", counts.get("genome_unique", 0))
+        logger.info("Genome multi-map reads: %d", len(multimap_reads))
+        selected_multimap = assign_multimap_reads(
+            multimap_reads=multimap_reads,
+            local_bin_size=local_bin_size,
         )
+        with measure("i.write_multimap"):
+            for read_info in multimap_reads:
+                writer.append(assignment_row(
+                    read_info, selected_multimap.pop(read_info.read_id), "multimap_assigned"
+                ))
+                counts["multimap_assigned"] += 1
+                read_info.candidates.clear()
+        multimap_reads.clear()
 
-    for read_info in multimap_reads:
-        rows.append(
-            assignment_row(
-                read_info=read_info,
-                candidate=selected_multimap[read_info.read_id],
-                assignment_type="multimap_assigned",
-            )
-        )
-
-
-    write_assignment_parquet(
-        rows=rows,
-        output_parquet=output_parquet,
-    )
-    write_assignment_stats(
-        rows=rows,
-        output_tsv=output_stats_tsv,
-    )
-
-    logger.info("Final assignments written: %d", len(rows))
+    _write_assignment_counts(counts, writer.row_count, output_stats_tsv)
+    logger.info("Final assignments written: %d", writer.row_count)
     logger.info("Assignment Parquet: %s", output_parquet)
     logger.info("Assignment statistics: %s", output_stats_tsv)
 

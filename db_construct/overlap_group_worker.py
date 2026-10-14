@@ -103,50 +103,53 @@ def find_groups_in_one_reference_strand(
         ),
     )
 
-    overlap_groups: list[
-        list[Transcript]
-    ] = []
+    working_transcripts = [
+        transcript for transcript in working_transcripts
+        if transcript.start is not None
+    ]
+    parents = list(range(len(working_transcripts)))
+    sizes = [1] * len(working_transcripts)
 
-    current_group: list[
-        Transcript
-    ] = []
+    def find(index: int) -> int:
+        while parents[index] != index:
+            parents[index] = parents[parents[index]]
+            index = parents[index]
+        return index
 
-    for transcript in working_transcripts:
-        if transcript.start is None:
-            continue
+    def union(first: int, second: int) -> None:
+        first, second = find(first), find(second)
+        if first == second:
+            return
+        if sizes[first] < sizes[second]:
+            first, second = second, first
+        parents[second] = first
+        sizes[first] += sizes[second]
 
-        if not current_group:
-            current_group = [
-                transcript
-            ]
-            continue
+    exon_intervals = sorted(
+        (start, end, index)
+        for index, transcript in enumerate(working_transcripts)
+        for start, end in transcript.exons
+        if start < end
+    )
+    rightmost_end = None
+    rightmost_index = None
+    for start, end, index in exon_intervals:
+        # The rightmost-reaching exon overlaps every next exon that starts
+        # before its end. Union transcript IDs, so their separate exons can
+        # connect distant interval clusters without merging intervening loci.
+        # Exons are half-open: touching endpoints do not count as overlap.
+        if rightmost_end is not None and start < rightmost_end:
+            union(index, rightmost_index)
+            if end > rightmost_end:
+                rightmost_end, rightmost_index = end, index
+        else:
+            rightmost_end, rightmost_index = end, index
 
-        has_overlap = any(
-            exons_overlap(
-                transcript,
-                existing,
-            )
-            for existing in current_group
-        )
-
-        if has_overlap:
-            current_group.append(
-                transcript
-            )
-            continue
-
-        overlap_groups.append(
-            current_group
-        )
-
-        current_group = [
-            transcript
-        ]
-
-    if current_group:
-        overlap_groups.append(
-            current_group
-        )
+    components: dict[int, list[Transcript]] = {}
+    for index, transcript in enumerate(working_transcripts):
+        components.setdefault(find(index), []).append(transcript)
+    # Preserve genomic/transcript-ID ordering for stable group numbering.
+    overlap_groups = list(components.values())
 
     print(
         "StringTie conservative collapse:",

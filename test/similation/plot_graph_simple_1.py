@@ -61,6 +61,16 @@ MAPPER_ORDER = [
 # Load data
 # ============================================================
 
+def iter_nh_series(nh_df):
+    """Keep LongRead/ShortRead counts and accuracy curves separate."""
+    if "mapper" not in nh_df.columns:
+        for dataset, frame in nh_df.groupby("dataset", sort=False):
+            yield dataset, frame.copy()
+    else:
+        for (dataset, mapper), frame in nh_df.groupby(["dataset", "mapper"], sort=False):
+            yield f"{dataset}_{mapper}", frame.copy()
+
+
 def load_summary():
 
     if not SUMMARY_FILE.exists():
@@ -253,7 +263,7 @@ def plot_overall_accuracy(
             )
         )
 
-        width = 0.36
+        width = min(0.36, 0.8 / len(MAPPER_ORDER))
 
         for (
             mapper_index,
@@ -261,6 +271,8 @@ def plot_overall_accuracy(
         ) in enumerate(
             MAPPER_ORDER
         ):
+            if not ((summary_df.dataset == dataset) & (summary_df.mapper == mapper)).any():
+                continue
 
             values = []
 
@@ -366,6 +378,8 @@ def plot_correct_mapping_comparison(
 
     for dataset in DATASET_ORDER:
         for mapper in MAPPER_ORDER:
+            if not ((summary_df.dataset == dataset) & (summary_df.mapper == mapper)).any():
+                continue
 
             categories.append(
                 f"{dataset}\n{mapper}"
@@ -461,14 +475,7 @@ def plot_ribotx_nh_accuracy(
     pdf=None,
 ):
 
-    for dataset in DATASET_ORDER:
-
-        df = nh_df[
-            nh_df[
-                "dataset"
-            ]
-            == dataset
-        ].copy()
+    for dataset, df in iter_nh_series(nh_df):
 
         if df.empty:
             continue
@@ -566,14 +573,7 @@ def plot_ribotx_nh_counts(
     pdf=None,
 ):
 
-    for dataset in DATASET_ORDER:
-
-        df = nh_df[
-            nh_df[
-                "dataset"
-            ]
-            == dataset
-        ].copy()
+    for dataset, df in iter_nh_series(nh_df):
 
         if df.empty:
             continue
@@ -651,14 +651,7 @@ def plot_star_multi_nh_accuracy(
     pdf=None,
 ):
 
-    for dataset in DATASET_ORDER:
-
-        df = nh_df[
-            nh_df[
-                "dataset"
-            ]
-            == dataset
-        ].copy()
+    for dataset, df in iter_nh_series(nh_df):
 
         if df.empty:
             continue
@@ -755,14 +748,7 @@ def plot_star_multi_nh_counts(
     pdf=None,
 ):
 
-    for dataset in DATASET_ORDER:
-
-        df = nh_df[
-            nh_df[
-                "dataset"
-            ]
-            == dataset
-        ].copy()
+    for dataset, df in iter_nh_series(nh_df):
 
         if df.empty:
             continue
@@ -869,6 +855,7 @@ def save_plot_tables(
 # ============================================================
 
 def main():
+    global DATASET_ORDER, MAPPER_ORDER
 
     # --------------------------------------------------------
     # Load
@@ -877,6 +864,10 @@ def main():
     summary_df = (
         load_summary()
     )
+
+    DATASET_ORDER = list(dict.fromkeys(summary_df["dataset"]))
+    names = list(dict.fromkeys(summary_df["mapper"]))
+    MAPPER_ORDER = (["STAR"] if "STAR" in names else []) + [m for m in names if m != "STAR"]
 
     ribotx_nh_df = (
         load_nh_table(

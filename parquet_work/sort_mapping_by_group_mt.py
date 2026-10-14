@@ -662,6 +662,9 @@ def sort_mapping_by_group(
         output_directory
     ).resolve()
 
+    if output_path == input_directory:
+        raise ValueError("Mapping-parts and sorted-output directories must be different.")
+
     parts_by_partition = find_mapping_parts(
         str(
             input_directory
@@ -672,6 +675,21 @@ def sort_mapping_by_group(
         parents=True,
         exist_ok=True,
     )
+
+    # Downstream EM reads every Parquet in this dedicated output directory.
+    # Clearing only outputs scheduled in this run leaves old chromosomes that
+    # no longer have hits, adding reads from a previous run to the current one.
+    previous_outputs = sorted(output_path.glob("*.parquet"))
+    if previous_outputs and not overwrite:
+        raise FileExistsError(
+            f"Sorted output directory already contains {len(previous_outputs)} Parquet file(s), "
+            f"including: {previous_outputs[0]}. Use a fresh output directory or set "
+            "sorting.overwrite: true (overwrite=True in the Python API) for a full restart."
+        )
+    if previous_outputs:
+        _print_status(f"Removing {len(previous_outputs):,} previous sorted Parquets for a fresh run")
+        for previous_output in previous_outputs:
+            previous_output.unlink()
 
     all_part_paths = [
         part_path

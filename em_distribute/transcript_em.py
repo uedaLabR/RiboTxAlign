@@ -1,5 +1,7 @@
 import csv
+import logging
 from pathlib import Path
+import time
 
 import pyarrow.parquet as pq
 
@@ -9,6 +11,25 @@ from em_distribute.transcript_group_multi import (
 )
 from em_distribute.reference_utils import *
 from em_distribute.cds_candidate_filter import build_group_cds_spans, filter_cds_candidates
+
+
+def create_transcript_em_logger(log_path: str | Path) -> logging.Logger:
+    """Create the transcript-EM file and console logger."""
+
+    path = Path(log_path).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger(f"RiboTxAlignTranscriptEM:{path}")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.handlers.clear()
+    formatter = logging.Formatter("%(asctime)s\t%(levelname)s\t%(message)s")
+    file_handler = logging.FileHandler(path, mode="w", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.addHandler(stream_handler)
+    return logger
 
 
 def iter_sorted_mapping_groups(
@@ -111,7 +132,16 @@ def em_transcript(
     transcript_merge_log_tsv: str | Path,
     reference_metadata_tsv: str | Path,
     reference_gtf: str | Path,
+    output_log_path: str | Path | None = None,
 ):
+
+    workflow_started_at = time.perf_counter()
+    if output_log_path is None:
+        output_log_path = Path(transcript_tpm_tsv).with_suffix(".transcript_em.log")
+    logger = create_transcript_em_logger(output_log_path)
+    logger.info("Transcript EM started")
+
+    loading_started_at = time.perf_counter()
 
     group_tpm = load_group_tpm(
         group_em_tsv
@@ -128,6 +158,10 @@ def em_transcript(
         reference_definitions=reference_definitions,
         reference_metadata_tsv=reference_metadata_tsv,
     )
+    logger.info(
+        "Transcript EM input loading elapsed: %.3f s",
+        time.perf_counter() - loading_started_at,
+    )
 
     # Start one log per execution; individual groups still append to it.
     # Write a header even when this run produces no transcript merges.
@@ -138,7 +172,6 @@ def em_transcript(
             "group_id", "source_transcript_id", "target_transcript_id",
         ])
 
-    reads_info = []
     group_cds_spans = build_group_cds_spans(reference_definitions)
     cds_region_rows = []
     cds_filter_rows = []
@@ -152,214 +185,238 @@ def em_transcript(
 
     transcript_em_cds_length = {}
 
-    for (
-        group_id,
-        group_records,
-    ) in iter_sorted_mapping_groups(
-        sorted_mapping_dir
-    ):
-
-        tpm = group_tpm.get(
+    group_processing_started_at = time.perf_counter()
+    processed_group_count = 0
+    positive_group_count = 0
+    with open_reads_info_writer(reads_info_parquet) as reads_info:
+        for (
             group_id,
-            0.0,
-        )
+            group_records,
+        ) in iter_sorted_mapping_groups(
+            sorted_mapping_dir
+        ):
 
-        if tpm <= 0.0:
-            continue
+            processed_group_count += 1
 
-        original_records = group_records
-        group_records, region_rows, lost_reads = filter_cds_candidates(
-            original_records, reference_definitions, group_cds_spans
-        )
-        cds_region_rows.extend(dict(group_id=group_id, **row) for row in region_rows)
-        read_priors = {}
-        for record in original_records:
-            read_id = record["read_id"]
-            if read_id not in read_priors:
-                read_priors[read_id] = calculate_group_probability(
-                    group_id=group_id,
-                    other_group_ids=record.get("other_group_ids") or [],
-                    group_tpm=group_tpm,
-                )
-        cds_filter_rows.append(dict(
-            group_id=group_id, input_reads=len(read_priors),
-            retained_reads=len(read_priors) - len(lost_reads),
-            unassigned_reads=len(lost_reads),
-            unassigned_expected_count=sum(read_priors[r] for r in lost_reads),
-            removed_hit_records=len(original_records) - len(group_records),
-        ))
-        if not group_records:
-            continue
-
-        transcript_ids = {
-            record["transcript_id"]
-            for record in group_records
-        }
-
-        print(
-            "group_id,tpm,num_transcripts,num_records",
-            group_id,
-            tpm,
-            len(transcript_ids),
-            len(group_records),
-        )
-
-        # ----------------------------------------------------
-        # Single-transcript group
-        # ----------------------------------------------------
-
-        if len(transcript_ids) == 1:
-
-            transcript_id = next(
-                iter(
-                    transcript_ids
-                )
+            tpm = group_tpm.get(
+                group_id,
+                0.0,
             )
 
-            process_single_transcript_group(
-                group_id=group_id,
-                transcript_id=transcript_id,
-                group_records=group_records,
-                group_tpm=group_tpm,
-                reads_info=reads_info,
-                transcript_tpm=transcript_tpm,
+            if tpm <= 0.0:
+                continue
+            positive_group_count += 1
+
+            original_records = group_records
+            group_records, region_rows, lost_reads = filter_cds_candidates(
+                original_records, reference_definitions, group_cds_spans
             )
-
-            # ------------------------------------------------
-            # Calculate expected read count
-            # ------------------------------------------------
-
-            expected_count = 0.0
-
-            seen_reads = set()
-
-            for record in group_records:
-
-                read_id = record[
-                    "read_id"
-                ]
-
-                if read_id in seen_reads:
-                    continue
-
-                seen_reads.add(
-                    read_id
-                )
-
-                other_group_ids = (
-                    record.get(
-                        "other_group_ids",
-                        [],
-                    )
-                )
-
-                if other_group_ids is None:
-                    other_group_ids = []
-
-                expected_count += (
-                    calculate_group_probability(
+            cds_region_rows.extend(dict(group_id=group_id, **row) for row in region_rows)
+            read_priors = {}
+            for record in original_records:
+                read_id = record["read_id"]
+                if read_id not in read_priors:
+                    read_priors[read_id] = calculate_group_probability(
                         group_id=group_id,
-                        other_group_ids=(
-                            other_group_ids
-                        ),
+                        other_group_ids=record.get("other_group_ids") or [],
                         group_tpm=group_tpm,
                     )
-                )
+            cds_filter_rows.append(dict(
+                group_id=group_id, input_reads=len(read_priors),
+                retained_reads=len(read_priors) - len(lost_reads),
+                unassigned_reads=len(lost_reads),
+                unassigned_expected_count=sum(read_priors[r] for r in lost_reads),
+                removed_hit_records=len(original_records) - len(group_records),
+            ))
+            if not group_records:
+                continue
 
-            transcript_expected_count[
-                transcript_id
-            ] = expected_count
+            transcript_ids = {
+                record["transcript_id"]
+                for record in group_records
+            }
 
-            # ------------------------------------------------
-            # CDS length
-            # ------------------------------------------------
-
-            original_cds_length = int(
-                reference_definitions[
-                    transcript_id
-                ].get(
-                    "cds_length",
-                    0,
-                )
+            print(
+                "group_id,tpm,num_transcripts,num_records",
+                group_id,
+                tpm,
+                len(transcript_ids),
+                len(group_records),
             )
 
-            transcript_length = int(
-                reference_definitions[
-                    transcript_id
-                ].get(
-                    "transcript_length",
-                    1,
+            # ----------------------------------------------------
+            # Single-transcript group
+            # ----------------------------------------------------
+
+            if len(transcript_ids) == 1:
+
+                transcript_id = next(
+                    iter(
+                        transcript_ids
+                    )
                 )
-            )
 
-            em_cds_length = (
-                reference_definitions[transcript_id]["em_region_length"]
-            )
-
-            transcript_original_cds_length[
-                transcript_id
-            ] = original_cds_length
-
-            transcript_em_cds_length[
-                transcript_id
-            ] = em_cds_length
-
-        # ----------------------------------------------------
-        # Multi-transcript group
-        # ----------------------------------------------------
-
-        elif len(transcript_ids) > 1:
-
-            result = (
-                process_multi_transcript_group(
+                process_single_transcript_group(
                     group_id=group_id,
-                    transcript_ids=transcript_ids,
+                    transcript_id=transcript_id,
                     group_records=group_records,
                     group_tpm=group_tpm,
                     reads_info=reads_info,
                     transcript_tpm=transcript_tpm,
-                    transcript_merge_log_tsv=(
-                        transcript_merge_log_tsv
-                    ),
-                    reference_definitions=(
-                        reference_definitions
-                    ),
                 )
-            )
 
-            if result is None:
-                continue
+                # ------------------------------------------------
+                # Calculate expected read count
+                # ------------------------------------------------
 
-            (
-                final_expected_counts,
-                original_cds_lengths,
-                em_cds_lengths,
-            ) = result
+                expected_count = 0.0
 
-            transcript_expected_count.update(
-                final_expected_counts
-            )
+                seen_reads = set()
 
-            transcript_original_cds_length.update(
-                original_cds_lengths
-            )
+                for record in group_records:
 
-            transcript_em_cds_length.update(
-                em_cds_lengths
-            )
+                    read_id = record[
+                        "read_id"
+                    ]
 
-        else:
+                    if read_id in seen_reads:
+                        continue
 
-            print(
-                "ERROR: no transcript found "
-                "in group",
-                group_id,
-            )
+                    seen_reads.add(
+                        read_id
+                    )
+
+                    other_group_ids = (
+                        record.get(
+                            "other_group_ids",
+                            [],
+                        )
+                    )
+
+                    if other_group_ids is None:
+                        other_group_ids = []
+
+                    expected_count += (
+                        calculate_group_probability(
+                            group_id=group_id,
+                            other_group_ids=(
+                                other_group_ids
+                            ),
+                            group_tpm=group_tpm,
+                        )
+                    )
+
+                transcript_expected_count[
+                    transcript_id
+                ] = expected_count
+
+                # ------------------------------------------------
+                # CDS length
+                # ------------------------------------------------
+
+                original_cds_length = int(
+                    reference_definitions[
+                        transcript_id
+                    ].get(
+                        "cds_length",
+                        0,
+                    )
+                )
+
+                transcript_length = int(
+                    reference_definitions[
+                        transcript_id
+                    ].get(
+                        "transcript_length",
+                        1,
+                    )
+                )
+
+                em_cds_length = (
+                    reference_definitions[transcript_id]["em_region_length"]
+                )
+
+                transcript_original_cds_length[
+                    transcript_id
+                ] = original_cds_length
+
+                transcript_em_cds_length[
+                    transcript_id
+                ] = em_cds_length
+
+            # ----------------------------------------------------
+            # Multi-transcript group
+            # ----------------------------------------------------
+
+            elif len(transcript_ids) > 1:
+
+                result = (
+                    process_multi_transcript_group(
+                        group_id=group_id,
+                        transcript_ids=transcript_ids,
+                        group_records=group_records,
+                        group_tpm=group_tpm,
+                        reads_info=reads_info,
+                        transcript_tpm=transcript_tpm,
+                        transcript_merge_log_tsv=(
+                            transcript_merge_log_tsv
+                        ),
+                        reference_definitions=(
+                            reference_definitions
+                        ),
+                    )
+                )
+
+                if result is None:
+                    continue
+
+                (
+                    final_expected_counts,
+                    original_cds_lengths,
+                    em_cds_lengths,
+                ) = result
+
+                transcript_expected_count.update(
+                    final_expected_counts
+                )
+
+                transcript_original_cds_length.update(
+                    original_cds_lengths
+                )
+
+                transcript_em_cds_length.update(
+                    em_cds_lengths
+                )
+
+            else:
+
+                print(
+                    "ERROR: no transcript found "
+                    "in group",
+                    group_id,
+                )
+
+            if processed_group_count % 1000 == 0:
+                logger.info(
+                    "Transcript EM progress: groups=%d positive_groups=%d reads_info_rows=%d elapsed=%.3fs",
+                    processed_group_count,
+                    positive_group_count,
+                    reads_info.row_count,
+                    time.perf_counter() - group_processing_started_at,
+                )
+
+    logger.info(
+        "Transcript EM group processing elapsed: %.3f s (groups=%d positive_groups=%d)",
+        time.perf_counter() - group_processing_started_at,
+        processed_group_count,
+        positive_group_count,
+    )
 
     # --------------------------------------------------------
     # Write read-level information
     # --------------------------------------------------------
 
+    output_started_at = time.perf_counter()
     for suffix, rows, fields in (
         ("cds_regions", cds_region_rows,
          ["group_id", "transcript_id", "region_source", "region_intervals", "em_region_length"]),
@@ -373,9 +430,9 @@ def em_transcript(
             writer.writeheader()
             writer.writerows(rows)
 
-    write_reads_info(
-        reads_info=reads_info,
-        output_parquet=reads_info_parquet,
+    logger.info(
+        "Transcript EM read output rows: %d (buffer limit=%d)",
+        reads_info.row_count, reads_info.batch_size,
     )
 
     # --------------------------------------------------------
@@ -447,6 +504,14 @@ def em_transcript(
         output_tsv=(
             source_tpm_tsv
         ),
+    )
+    logger.info(
+        "Transcript EM output writing elapsed: %.3f s",
+        time.perf_counter() - output_started_at,
+    )
+    logger.info(
+        "Transcript EM total elapsed: %.3f s",
+        time.perf_counter() - workflow_started_at,
     )
 
     # --------------------------------------------------------

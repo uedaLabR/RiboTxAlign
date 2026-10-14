@@ -73,6 +73,7 @@ Python dependencies:
 - NumPy
 - pandas
 - PyArrow
+- pyBigWig (for the default BigWig depth outputs)
 - pysam
 
 ## Installation
@@ -105,7 +106,6 @@ reference:
   genome_fai: /path/to/genome.fa.fai
 
 pipeline:
-  use_deduplicated_fastq: true
   delete_intermediate_files: true
 ```
 
@@ -118,11 +118,16 @@ The following sample-specific values are command-line options and are not stored
 --stringtie-gtf
 ```
 
-`reference.genome_fai` may be omitted when the index is located at `<genome_fasta>.fai`. All analysis parameters have defaults. The complete `RiboTxAlign.yaml` file contains the available settings used by the current pipeline. Relative paths in the YAML file are resolved relative to the YAML file itself. Command-line paths are resolved from the current working directory.
+`reference.genome_fai` may be omitted when the index is located at `<genome_fasta>.fai`. All analysis parameters have defaults. `RiboTxAlign_human.yaml` and `RiboTxAlign_mouse.yaml` contain the available settings used by the current pipeline. Relative paths in the YAML file are resolved relative to the YAML file itself. Command-line paths are resolved from the current working directory.
+
+Genome rescue uses `rescue.contiguous_preset` (default `sr`) and
+`rescue.splice_preset` (default `splice`). `rescue.preset` is not a supported
+setting.
 
 ## Commands
 
-Use the same `--sample-name` and `--output-dir` for all three commands belonging to one sample.
+Use the same `--sample-name` and `--output-dir` for `create-reference` and `run`.
+`deduplicate` takes explicit input and output FASTQ paths.
 
 ### 1. Build the reference
 
@@ -147,27 +152,20 @@ Standard outputs:
 
 ```bash
 ribotxalign deduplicate \
-  --config RiboTxAlign_human.yaml \
-  --sample-name SRR26942051 \
-  --output-dir /path/to/RiboTxAlign_output \
-  --fastq /path/to/reads.fastq.gz
+  --fastq /path/to/reads.fastq.gz \
+  --output-fastq /path/to/RiboTxAlign_output/SRR26942051/reads/SRR26942051.deduplicated.fastq.gz
 ```
 
-Standard outputs:
+Outputs for the chosen `--output-fastq` path:
 
 ```text
 <output_dir>/<sample_name>/reads/<sample_name>.deduplicated.fastq.gz
-<output_dir>/<sample_name>/reads/<sample_name>.deduplication.stats.tsv
+<output_dir>/<sample_name>/reads/<sample_name>.deduplicated.fastq.gz.stats.tsv
 ```
 
-When UMI deduplication is not required, set:
-
-```yaml
-pipeline:
-  use_deduplicated_fastq: false
-```
-
-The `run` command then uses the FASTQ supplied with `--fastq` directly.
+The `run` command always uses the FASTQ supplied with `--fastq` directly.
+Pass the deduplicated output when using UMI deduplication, or the original
+FASTQ when skipping it. There is no `pipeline.use_deduplicated_fastq` setting.
 
 ### 3. Run steps c through l
 
@@ -176,10 +174,11 @@ ribotxalign run \
   --config RiboTxAlign_human.yaml \
   --sample-name SRR26942051 \
   --output-dir /path/to/RiboTxAlign_output \
-  --fastq /path/to/reads.fastq.gz
+  --fastq /path/to/RiboTxAlign_output/SRR26942051/reads/SRR26942051.deduplicated.fastq.gz
 ```
 
-The command uses the standard reference paths created by `create-reference`. The same `--sample-name` and `--output-dir` must therefore be used. When `pipeline.use_deduplicated_fastq` is true, `--fastq` identifies the original input and the command reads the standard deduplicated output for that sample.
+The command uses the standard reference paths created by `create-reference`.
+The same `--sample-name` and `--output-dir` must therefore be used.
 
 ## Standard output layout
 
@@ -195,7 +194,7 @@ With `pipeline.delete_intermediate_files: true`, temporary mapping shards, group
 ├── reads/
 │   ├── <sample_name>.deduplicated.fastq.gz
 │   ├── <sample_name>.unmapped.fastq.gz
-│   └── <sample_name>.deduplication.stats.tsv
+│   └── <sample_name>.deduplicated.fastq.gz.stats.tsv
 ├── mapping/
 │   ├── <sample_name>.mapping.log
 │   └── <sample_name>.mapping_stats.json
@@ -308,6 +307,49 @@ parameters are configured in the YAML `rescue` section.
 Transcript candidates that produce the same genome alignment are collapsed before BAM output. Genome-unique alignments are fixed directly. Remaining multi-mapping reads are assigned at transcript-group level.
 
 The assignment objective minimizes the change in relative squared error between assigned read counts and posterior-derived group expectations. It therefore preserves the group TPM pattern rather than minimizing absolute count deficits, which would otherwise favor highly expressed groups.
+
+## Mapping and group EM memory settings
+
+Stage c caches reference-name parsing and decoy/ALT classification in bounded
+per-process caches (up to 65,536 entries per cache). Alignment scores and
+read-dependent filtering are still evaluated for every read. CDS intervals
+continue to be loaded once per worker.
+
+`mapping.parquet_row_group_size` (default 100,000) also caps the total Python
+rows buffered by each mapping writer across all chromosomes. Rows are stored
+as columns and flushed incrementally. The input FASTQ chunk, mappy index,
+reference caches, and open Parquet writers use additional memory. The part
+filenames, schema, hit order, and per-chromosome row order are unchanged.
+
+Stage f defaults to compact integer candidate arrays and float64 NumPy EM:
+
+```yaml
+group_em:
+  engine: numpy
+  keep_iteration_history: false
+```
+
+Zero-TPM candidate sets retain equal allocation. By default only iteration
+zero and the latest iteration are kept; the output TSV still contains initial
+and final TPM, expected counts, and multi-hit record counts. Python API
+callers using `run_group_em` should read `GroupEmInfo.multi_hit_record_count`
+with the NumPy engine: individual `multi_hit_records` are not retained.
+Set `keep_iteration_history: true` to retain every iteration. Set
+`engine: python` to use the original arithmetic and per-read objects for
+comparison. NumPy reductions may introduce small floating-point differences;
+bit-for-bit identity is not guaranteed.
+
+The synthetic comparison can be repeated against a saved pre-change tree:
+
+```bash
+python test/benchmark_mapping_em_optimization.py \
+  --baseline-dir /path/to/pre-change-source \
+  --output-dir /path/to/new-benchmark-directory
+```
+
+Use a new output directory. This benchmark checks output equivalence and
+measures c's Python postprocessing/Parquet output (excluding mappy), plus f's
+loading, iterations, and output. It is not an end-to-end sample benchmark.
 
 ## Restarting after a mapping failure
 
