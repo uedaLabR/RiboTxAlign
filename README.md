@@ -42,7 +42,7 @@ Required inputs are:
 - A StringTie transcript GTF containing transcript structures and RNA abundance information.
 - Single-end Ribo-seq FASTQ or FASTQ.GZ, after the desired adapter, length, and contaminant filtering.
 
-Copy `RiboTxAlign_human.yaml` or `RiboTxAlign_mouse.yaml` and replace the reference paths. These files contain example machine-specific paths, not portable reference downloads.
+Use `RiboAlign_example.yaml`, based on `RiboTxAlign_mouse.yaml`, as the configuration template. Copy it to `my_config.yaml` and replace the placeholder reference paths with your own files. StringTie assembly is performed beforehand; its GTF is supplied with `--stringtie-gtf`.
 
 ```yaml
 reference:
@@ -57,14 +57,14 @@ pipeline:
 
 `genome_fai` defaults to `<genome_fasta>.fai`. YAML paths are resolved relative to the YAML file; command-line paths are resolved relative to the current directory. Sample name, output directory, FASTQ, and StringTie GTF are supplied on the command line.
 
-**`run` always reads the file supplied by `--fastq`.** The legacy `pipeline.use_deduplicated_fastq` setting present in the example YAML files is not used by the current pipeline. Deduplication must be run separately, and its output passed explicitly to `run`.
+**`run` always reads the file supplied by `--fastq`.** Deduplication must be run separately, and its output passed explicitly to `run`.
 
 ### Editing the YAML file
 
-Start with the supplied human or mouse configuration and change the three `reference` paths to your own files. Use a matching genome assembly and annotation (for example, hg38 with its corresponding human annotation). Keep the remaining analysis settings initially; the supplied settings differ from some internal defaults, so copying the full example preserves the intended configuration.
+Start with `RiboAlign_example.yaml` and change the `reference` paths to your own files. Use a matching genome assembly and annotation (for example, hg38 with its corresponding human annotation). Keep the remaining analysis settings initially; the supplied settings differ from some internal defaults, so copying the full example preserves the intended configuration.
 
 ```bash
-cp RiboTxAlign_human.yaml my_config.yaml
+cp RiboAlign_example.yaml my_config.yaml
 # Edit my_config.yaml, then supply --config my_config.yaml to the commands below.
 ```
 
@@ -97,9 +97,9 @@ Use spaces for indentation, `true`/`false` for boolean values, and `null` for an
 | `bam.sort_threads` | Threads used for final BAM sorting. |
 | `bam.sort_memory` | BAM sorting memory limit per thread, for example `2G`; it is not a whole-pipeline memory limit. |
 
-The `batch_size` settings control processing batches in their respective stages. EM2 settings are currently supplied by the implementation rather than a separate YAML section. The `stringtie` section is used by the separate `run_stringtie_ribotxalign.py` helper; `create-reference` takes an already assembled GTF and does not run StringTie.
+The `batch_size` settings control processing batches in their respective stages. EM2 settings are currently supplied by the implementation rather than a separate YAML section. `create-reference` takes an already assembled GTF and does not run StringTie; no StringTie execution settings are needed in this YAML.
 
-Two legacy settings in the example files need attention: `pipeline.use_deduplicated_fastq` is ignored (pass the desired FASTQ explicitly), and the current rescue preset keys are `rescue.contiguous_preset` and `rescue.splice_preset`, not `rescue.preset`. Their defaults are `sr` and `splice`, respectively.
+The rescue presets are configured with `rescue.contiguous_preset` (`sr`) and `rescue.splice_preset` (`splice`).
 
 ## Quick start
 
@@ -107,7 +107,7 @@ Two legacy settings in the example files need attention: `pipeline.use_deduplica
 
 ```bash
 python RiboTxAlign_Cmd.py create-reference \
-  --config RiboTxAlign_human.yaml \
+  --config my_config.yaml \
   --sample-name sample1 \
   --output-dir results \
   --stringtie-gtf /path/to/stringtie.transcripts.gtf
@@ -133,7 +133,7 @@ If deduplication was performed:
 
 ```bash
 python RiboTxAlign_Cmd.py run \
-  --config RiboTxAlign_human.yaml \
+  --config my_config.yaml \
   --sample-name sample1 \
   --output-dir results \
   --fastq results/sample1/reads/sample1.deduplicated.fastq.gz
