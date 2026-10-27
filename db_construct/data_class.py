@@ -40,6 +40,8 @@ class Transcript:
         default_factory=list
     )
     resolution_type: str = "unresolved"
+    # Annotation aliases with identical genomic CDS, not observed source members.
+    cds_equivalent_transcript_ids: list[str] = field(default_factory=list)
 
     @property
     def transcript_length(self) -> int:

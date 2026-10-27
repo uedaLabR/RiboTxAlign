@@ -591,6 +591,7 @@ def write_transcript_tpm_with_source(
         "gencode_transcript_ids",
         "stringtie_transcript_ids",
         "source_transcript_ids",
+        "cds_equivalent_transcript_ids",
     ]
 
     with open(
@@ -619,6 +620,9 @@ def write_transcript_tpm_with_source(
             writer.writerow(
                 {
                     "reference_id": reference_id,
+                    "cds_equivalent_transcript_ids": row.get(
+                        "cds_equivalent_transcript_ids", "",
+                    ),
 
                     "overlap_group_id": row.get(
                         "overlap_group_id",
